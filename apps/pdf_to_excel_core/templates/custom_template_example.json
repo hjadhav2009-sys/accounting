@@ -1,0 +1,5 @@
+{
+  "template_name": "Custom Template Example",
+  "template_id": "custom_example",
+  "note": "Use the Rule Builder screen to write your own notes/rules. Core code currently supports built-in parsers for Flipkart and Sujal formats."
+}

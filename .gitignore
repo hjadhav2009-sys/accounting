@@ -1,0 +1,59 @@
+# Python / environment
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+Thumbs.db
+.vscode/settings.json
+
+# NEVER publish local accounting/customer data
+data/*.db
+data/*.db-*
+data/*.sqlite*
+data/*.json
+uploads/*
+!uploads/.gitkeep
+output/
+exports/
+backups/
+audit/
+logs/
+tmp/
+cache/
+v2_data/
+tests/private_fixtures/*
+!tests/private_fixtures/README.example.md
+node_modules/
+.next/
+.next-*/
+v2/frontend/build-phase2/
+v2/frontend/build-phase2b/
+*.tsbuildinfo
+
+# Generated accounting exports / source documents
+*.pdf
+*.xlsx
+*.xls
+*.csv
+*.xml
+*.zip
+*.7z
+*.rar
+
+# Local/private baseline evidence (replace with sanitized public fixtures/reports)
+*_REPORT.txt
+BASELINE_SHA256.txt
+
+# Secrets / credentials
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*.json
+*secret*.json
+**/.streamlit/secrets.toml

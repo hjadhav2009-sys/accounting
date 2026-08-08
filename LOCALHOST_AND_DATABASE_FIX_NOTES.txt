@@ -1,0 +1,31 @@
+LOCALHOST AND DATABASE FIX NOTES
+
+Problem:
+- The browser always shows localhost:8501.
+- If an old CMD/Streamlit is still running, localhost:8501 may still use the OLD folder even after you moved/copied the files.
+- Then rules/PDF tools look broken because you are not actually running the new folder.
+
+New files:
+1. START_CLEAN_DASHBOARD.bat
+   - closes anything currently using localhost:8501 and 8510
+   - clears Python __pycache__
+   - repairs requirements
+   - clears Streamlit cache
+   - starts dashboard from THIS folder
+
+2. STOP_LOCALHOST.bat
+   - closes localhost 8501 and 8510
+
+3. REPAIR_DATABASE.bat
+   - runs database normalize/cleanup without browser
+
+4. install_and_run.bat and run_dashboard.bat now call START_CLEAN_DASHBOARD.bat
+
+Correct workflow after moving folder:
+1. Close all old CMD windows
+2. Extract/copy folder to final location
+3. Double-click START_CLEAN_DASHBOARD.bat
+4. On Home page, check Current running folder
+5. Check Database file path
+6. Go to Shared Database Pro and click Repair database now
+7. Then test Marketplace / Bank / PDF-to-Excel

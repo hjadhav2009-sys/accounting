@@ -1,0 +1,42 @@
+HOW TO SETUP NEW COMPANY
+
+1. Open http://localhost:8501
+2. Go to Shared Database.
+3. Company tab:
+   - Add company name
+   - Tally company name must match Tally exactly
+   - Add GSTIN and State
+   - Add exact ledgers: Suspense, INPUT CGST, INPUT SGST, INPUT IGST
+
+4. Bank Accounts tab:
+   - account_hint = account number/text from bank statement
+   - bank_ledger = exact Tally bank ledger
+
+5. Party Ledgers tab:
+   amazon   -> exact Amazon party ledger in Tally
+   flipkart -> exact Flipkart party ledger in Tally
+   meesho   -> exact Meesho party ledger in Tally
+   myntra   -> exact Myntra party ledger in Tally
+   unknown  -> Suspense
+
+6. Ledger Mapping tab:
+   Marketplace:
+   tool = marketplace
+   platform = amazon / flipkart / meesho / myntra
+   pattern = fee name from PDF
+   ledger = exact Tally expense ledger
+
+   Bank:
+   tool = bank
+   platform = blank
+   pattern = narration text
+   ledger = exact Tally ledger
+
+7. Voucher Rules tab:
+   Tax Invoice -> Purchase
+   Credit Note -> Debit Note
+
+IMPORTANT:
+- Do not delete data/business_rules.db
+- It stores company and ledger mappings
+- When updating ZIP, copy old data/business_rules.db into new data folder

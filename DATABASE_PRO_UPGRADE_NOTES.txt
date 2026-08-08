@@ -1,0 +1,54 @@
+DATABASE PRO UPGRADE NOTES
+
+Main upgrades:
+1. Shared Database Pro dashboard added.
+2. Database speed improved with cache; init_db no longer reseeds on every small lookup.
+3. Company-wise database sync improved across:
+   - Marketplace PDF -> Tally XML
+   - Bank Statement -> Tally XML
+   - Shared Database Pro
+4. Delete features added:
+   - Delete company safely
+   - Delete selected rows from bank accounts / party ledgers / ledger mappings / voucher rules
+5. Excel export/import added:
+   - Export company mappings to XLSX
+   - Edit ledger mapping in Excel
+   - Import back to dashboard
+   - Append/upsert mode
+   - Replace selected company table mode
+   - Automatic backup before import
+6. Backup and cleanup added:
+   - Download business_rules.db
+   - Manual backup
+   - Normalize spaces/newlines/tabs
+   - Remove duplicate rows
+7. Bank mapping improved:
+   - Blank narration patterns are not saved as rules
+   - Blank narration stays Suspense / review
+8. Ledger mapping engine improved:
+   - contains, smart_contains, equals, starts_with, regex supported
+   - company-specific rules first
+   - Default Company fallback second
+9. Party ledger platform normalization improved.
+10. New company setup improved:
+   - Add blank company
+   - Copy existing company with all mappings
+11. Dashboard warnings added:
+   - Blank patterns
+   - Suspense/empty mappings
+   - Suspense party ledgers
+
+Recommended workflow:
+1. Create/copy company in Shared Database Pro.
+2. Upload PDF/bank statement once.
+3. Save on-spot mappings.
+4. For big work, export mapping Excel.
+5. Fill ledger names in Excel.
+6. Import Excel back using Append/upsert.
+7. Cleanup database.
+8. Scan again and export XML.
+
+Important database file:
+data/business_rules.db
+
+Keep this file safe. It stores company, bank, marketplace, party, GST and voucher rules.

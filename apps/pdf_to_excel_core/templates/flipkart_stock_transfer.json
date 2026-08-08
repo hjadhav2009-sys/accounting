@@ -1,0 +1,17 @@
+{
+  "template_name": "Flipkart Stock Transfer Invoice",
+  "template_id": "flipkart_stock_transfer",
+  "detect_when_contains": ["Stock Transfer Invoice", "Invoice Id", "IGST", "Commercial Value"],
+  "mapping": {
+    "DATE": "Invoice Date",
+    "INVOICE NO(Invoice Id).": "Invoice Id",
+    "GSTIN( from ship to )": "GSTIN from Ship To section",
+    "TRADE NAME( from Ship To Shiv Jagdamba,)": "First name line in Ship To section",
+    "RATE": "IGST Rate",
+    "TAXABLE": "Base Price",
+    "HSN CODE": "HSN, force 18% to 73269099 if enabled",
+    "QTY": "Qty",
+    "Platform Name(Optional)": "Flipkart",
+    "GSTIN of e-commerce operator ( from  shipped from )": "GSTIN from Shipped From section"
+  }
+}

@@ -1,0 +1,19 @@
+IMPORT ERROR FIXED
+
+Error fixed:
+ModuleNotFoundError / import error like:
+from extractor.pdf_reader import read_pdf
+
+Reason:
+PDF Core was embedded in one-port dashboard, but its local extractor folder was not on Python path.
+
+Fix:
+main_app.py now temporarily changes working folder and sys.path to apps/pdf_to_excel_core when running PDF Core.
+
+Use:
+install_and_run.bat
+or
+run_dashboard.bat
+
+Both tools are still on:
+http://localhost:8501

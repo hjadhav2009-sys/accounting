@@ -1,0 +1,5 @@
+# Standard-library unittest remains the authoritative regression runner.
+# Add developer-only tools here with reviewed pins when needed.
+-r requirements.txt
+-r requirements-v2.txt
+httpx2>=2.9,<3

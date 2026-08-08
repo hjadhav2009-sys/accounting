@@ -1,0 +1,19 @@
+{
+  "template_name": "Sujal Tax Invoice",
+  "template_id": "sujal_tax_invoice",
+  "detect_when_contains": [
+    "Tax Invoice",
+    "Invoice No",
+    "Taxable amount"
+  ],
+  "mapping": {
+    "DATE": "Date",
+    "INVOICE NO(Invoice Id).": "Invoice No",
+    "GSTIN( from ship to )": "Bill To GSTIN",
+    "TRADE NAME( from Ship To Shiv Jagdamba,)": "Bill To name",
+    "RATE": "Tax summary Rate",
+    "TAXABLE": "Quantity \u00d7 Unit Price from item rows, combined by rate + HSN",
+    "HSN CODE": "Parsed from item table; 18% can be forced to configured HSN if enabled",
+    "QTY": "Parsed from item table and combined by rate + HSN"
+  }
+}

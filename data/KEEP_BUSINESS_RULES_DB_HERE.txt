@@ -1,0 +1,1 @@
+Keep business_rules.db here. This stores your companies and ledger mappings.

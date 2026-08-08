@@ -1,0 +1,23 @@
+FINAL DEBUG NOTES
+
+Critical final fix:
+- Amazon credit notes and tax invoices now keep each summary line as a separate row.
+- Earlier parser grouped repeated Amazon service descriptions together. That is why 188 manual rows were becoming 136 rows.
+- Now repeated rows like FBA Weight Handling Shipping Fee appear separately, matching manual Tally-style entries.
+
+Verified result on uploaded PDFs:
+- 46 PDFs scanned
+- 188 rows created
+- Status: 188 OK
+- No parser errors
+- Only difference against the uploaded Excel sheet: Excel file contains 187 rows, while parser now reads 188; messo.pdf is split into 2 proper service rows.
+
+Other fixes:
+- Meesho service row parsing fixed
+- Myntra description cleanup fixed
+- Removal Fee / Ad Services Fee / Business Support Services mappings added
+- Credit Note -> Debit Note
+- Tax Invoice -> Purchase
+- Unknown ledger -> Suspense + REVIEW
+
+Always check QA Report before import.
