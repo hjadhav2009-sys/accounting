@@ -13,7 +13,7 @@ DEFAULT_STORAGE_ROOT = REPOSITORY_ROOT / "v2_data" / "documents"
 @dataclass(frozen=True)
 class Settings:
     app_name: str = "Business Automation Platform"
-    api_version: str = "2.0-foundation"
+    api_version: str = "2.0-phase3-foundation"
     environment: str = "development"
     database_adapter_mode: str = "LEGACY_SQLITE"
     database_url: str = ""
@@ -25,6 +25,11 @@ class Settings:
     cloudflare_ai_gateway_id: str = ""
     postgres_shadow_enabled: bool = False
     dev_endpoints_enabled: bool = False
+    cors_origins: tuple[str, ...] = ("http://localhost:3000", "http://127.0.0.1:3000")
+    tesseract_cmd: str = ""
+    ocr_max_concurrency: int = 1
+    ocr_timeout_seconds: int = 120
+    ocr_max_pages: int = 50
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -40,6 +45,13 @@ class Settings:
             cloudflare_ai_gateway_id=os.getenv("CLOUDFLARE_AI_GATEWAY_ID", ""),
             postgres_shadow_enabled=os.getenv("POSTGRES_SHADOW_ENABLED", "").strip().lower() in {"1", "true", "yes"},
             dev_endpoints_enabled=os.getenv("V2_DEV_ENDPOINTS_ENABLED", "").strip().lower() in {"1", "true", "yes"},
+            cors_origins=tuple(origin.strip() for origin in os.getenv(
+                "V2_CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+            ).split(",") if origin.strip()),
+            tesseract_cmd=os.getenv("TESSERACT_CMD", "").strip(),
+            ocr_max_concurrency=max(1, min(4, int(os.getenv("OCR_MAX_CONCURRENCY", "1")))),
+            ocr_timeout_seconds=max(10, min(600, int(os.getenv("OCR_TIMEOUT_SECONDS", "120")))),
+            ocr_max_pages=max(1, min(200, int(os.getenv("OCR_MAX_PAGES", "50")))),
         )
 
     def public_info(self) -> dict[str, str]:

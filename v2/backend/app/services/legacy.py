@@ -23,6 +23,12 @@ def _pdf_core_import_path() -> Iterator[None]:
 
 
 class LegacyPdfToExcelService:
+    def detect_template(self, text: str) -> str:
+        with _pdf_core_import_path():
+            from extractor.parsers import detect_template
+
+            return detect_template(text)
+
     def parse_text(
         self,
         template: str,
