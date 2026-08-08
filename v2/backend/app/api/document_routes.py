@@ -16,6 +16,7 @@ from ..document_intelligence.repository import DocumentRepository
 from ..document_intelligence.security import DocumentSecurityError, ResourceLimits
 from ..infrastructure.postgres import psycopg_connection_factory
 from ..services.storage import LocalFilesystemStorage
+from ..domain.enums import Role
 
 
 router = APIRouter(prefix="/api/v2", tags=["document-intelligence"])
@@ -27,14 +28,22 @@ class RequestContext:
     organization_id: UUID
     company_id: UUID
     user_id: UUID
+    roles: frozenset[Role] = frozenset({Role.VIEWER})
 
 
 def request_context(
     organization_id: Annotated[UUID, Header(alias="X-Organization-ID")],
     company_id: Annotated[UUID, Header(alias="X-Company-ID")],
     user_id: Annotated[UUID, Header(alias="X-User-ID")],
+    roles: Annotated[str, Header(alias="X-Roles")] = "VIEWER",
 ) -> RequestContext:
-    return RequestContext(organization_id, company_id, user_id)
+    parsed: set[Role] = set()
+    for value in roles.split(","):
+        try:
+            parsed.add(Role(value.strip().upper()))
+        except ValueError:
+            continue
+    return RequestContext(organization_id, company_id, user_id, frozenset(parsed or {Role.VIEWER}))
 
 
 def services() -> tuple[DocumentRepository, LocalFilesystemStorage]:

@@ -13,7 +13,7 @@ DEFAULT_STORAGE_ROOT = REPOSITORY_ROOT / "v2_data" / "documents"
 @dataclass(frozen=True)
 class Settings:
     app_name: str = "Business Automation Platform"
-    api_version: str = "2.0-phase3-foundation"
+    api_version: str = "2.0-phase4-template-studio"
     environment: str = "development"
     database_adapter_mode: str = "LEGACY_SQLITE"
     database_url: str = ""

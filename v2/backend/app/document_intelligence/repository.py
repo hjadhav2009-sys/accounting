@@ -166,23 +166,25 @@ class DocumentRepository:
     def resolve_known_format(self, record: DocumentRecord, route: str) -> tuple[UUID, UUID]:
         family_name = route.replace(":", " / ").replace("_", " ").title()
         with self._cursor() as cursor:
-            cursor.execute("SELECT id FROM document_format_families WHERE organization_id=%s AND name=%s",
-                           (record.organization_id, family_name))
+            cursor.execute("""SELECT id FROM document_format_families
+                WHERE organization_id=%s AND company_id=%s AND name=%s""",
+                (record.organization_id, record.company_id, family_name))
             row = cursor.fetchone()
             family_id = row[0] if row else uuid4()
             if not row:
-                cursor.execute("""INSERT INTO document_format_families(id,organization_id,name,supplier,document_type)
-                    VALUES(%s,%s,%s,%s,%s)""", (family_id, record.organization_id, family_name,
-                    record.supplier or None, record.document_type or "Accounting Document"))
+                cursor.execute("""INSERT INTO document_format_families(id,organization_id,company_id,name,supplier,document_type,created_by)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s)""", (family_id, record.organization_id, record.company_id,
+                    family_name, record.supplier or None, record.document_type or "Accounting Document", record.created_by))
             cursor.execute("""SELECT id FROM template_versions WHERE family_id=%s AND status='APPROVED'
                 ORDER BY version DESC LIMIT 1""", (family_id,))
             version = cursor.fetchone()
             template_id = version[0] if version else uuid4()
             if not version:
-                cursor.execute("""INSERT INTO template_versions(id,family_id,version,status,definition,created_by,approved_by,approved_at)
-                    VALUES(%s,%s,1,'APPROVED',%s::jsonb,%s,%s,now())""",
+                cursor.execute("""INSERT INTO template_versions(id,family_id,version,status,definition,created_by,approved_by,approved_at,
+                    engine,validation_profile,updated_by)
+                    VALUES(%s,%s,1,'APPROVED',%s::jsonb,%s,%s,now(),'LEGACY_PARSER','GENERIC',%s)""",
                     (template_id, family_id, json.dumps({"route": route, "adapter": "certified-legacy"}),
-                     record.created_by, record.created_by))
+                     record.created_by, record.created_by, record.created_by))
             cursor.execute("UPDATE format_fingerprints SET family_id=%s WHERE organization_id=%s AND document_id=%s",
                            (family_id, record.organization_id, record.document_id))
         return family_id, template_id

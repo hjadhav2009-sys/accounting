@@ -78,7 +78,7 @@ export function DocumentDetail({ documentId }: { documentId: string }) {
         <div><dt>Quality</dt><dd>{detail.quality_status || "—"}</dd></div><div><dt>Pages</dt><dd>{detail.page_count}</dd></div></dl></section>
     {detail.error_code === "FORMAT_UNKNOWN" && <section className="new-format-banner"><div><p className="eyebrow">New format detected</p><h2>Review-only format evidence</h2>
       <p>Native quality: {detail.quality_status || "unknown"} · OCR used: {detail.extraction_method === "LOCAL_OCR" ? "YES" : "NO"}. No approved format met deterministic routing rules.</p>
-      <p>{extraction?.normalized_result?.warnings?.join(" · ") || "No similar approved candidate was selected."}</p></div><a className="primary primary-link" href="/reviews?reason=UNKNOWN_FORMAT">Review format</a></section>}
+      <p>{extraction?.normalized_result?.warnings?.join(" · ") || "No similar approved candidate was selected."}</p></div><a className="primary primary-link" href={`/template-studio?documentId=${documentId}`}>Open Template Studio</a></section>}
     <section className="evidence-grid">
       <div className="pdf-stage"><div className="viewer-toolbar">
         <button onClick={() => setPage(Math.max(1, page - 1))} disabled={page === 1}>Previous</button><span>Page {page} / {detail.page_count}</span>

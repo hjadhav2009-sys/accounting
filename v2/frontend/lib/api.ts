@@ -3,6 +3,7 @@ export type ApiContext = {
   organizationId: string;
   companyId: string;
   userId: string;
+  roles: string;
 };
 
 let cachedContext: ApiContext | null | undefined;
@@ -14,6 +15,7 @@ export function apiContext(): ApiContext | null {
     organizationId: process.env.NEXT_PUBLIC_ORGANIZATION_ID || "",
     companyId: process.env.NEXT_PUBLIC_COMPANY_ID || "",
     userId: process.env.NEXT_PUBLIC_USER_ID || "",
+    roles: process.env.NEXT_PUBLIC_USER_ROLES || "ADMIN",
   };
   cachedContext = context.organizationId && context.companyId && context.userId ? context : null;
   return cachedContext;
@@ -24,5 +26,6 @@ export function tenantHeaders(context: ApiContext): HeadersInit {
     "X-Organization-ID": context.organizationId,
     "X-Company-ID": context.companyId,
     "X-User-ID": context.userId,
+    "X-Roles": context.roles,
   };
 }
