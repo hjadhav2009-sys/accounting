@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid5
 
-from shared.database import norm_platform, norm_text
+from ..domain.mapping import normalize_platform as norm_platform,normalize_text as norm_text
 
 
 LEGACY_NAMESPACE = UUID("657bbe41-1ac9-54ed-8acd-0d51369dfc29")

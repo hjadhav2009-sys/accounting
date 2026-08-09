@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 from v2.backend.app.config import Settings
 from v2.backend.app.domain import CompanyAccess, Job, JobStatus, Money, Permission, Role, TaxBucket
+from v2.backend.app.domain.mapping import mapping_matches,normalize_platform,normalize_text
 from v2.backend.app.infrastructure.migration_verifier import inspect_sqlite
 from v2.backend.app.infrastructure.shadow_migration import stable_legacy_uuid
 from v2.backend.app.jobs import InvalidJobTransition, PersistentJobManager
@@ -88,6 +89,15 @@ class ShadowParityTests(unittest.TestCase):
 
 
 class TenantAndAuthorizationTests(unittest.TestCase):
+    def test_shared_mapping_matcher_supports_all_five_modes(self):
+        cases=(("Service Fee ABC","fee","contains"),("Service-Fee ABC","service fee","smart_contains"),
+               ("  Exact Value  ","exact value","equals"),("Prefix value","prefix","starts_with"),
+               ("Invoice 42","Invoice\\s+\\d+","regex"))
+        for text,pattern,mode in cases:
+            with self.subTest(mode=mode):self.assertTrue(mapping_matches(text,pattern,mode))
+        self.assertFalse(mapping_matches("anything","[broken","regex"));self.assertFalse(mapping_matches("anything","","contains"))
+        self.assertEqual(normalize_platform("  Amazon Marketplace  "),"amazonmarketplace")
+        self.assertEqual(normalize_text("  Ledger\n Name  "),"Ledger Name")
     def test_identical_patterns_do_not_grant_cross_tenant_access(self):
         org_a, org_b, company_a1, company_a2 = uuid4(), uuid4(), uuid4(), uuid4()
         access = CompanyAccess(org_a, company_a1, uuid4(), frozenset({"ACCOUNTANT"}))
@@ -391,6 +401,18 @@ class PostgreSQLRuntimeIntegrationTests(unittest.TestCase):
             connection.rollback()
         finally:
             connection.close()
+
+    def test_default_company_is_not_read_across_forced_rls_boundary(self):
+        import psycopg
+        from v2.backend.app.infrastructure.postgres import PostgresRepositories
+        org,current,default,user=uuid4(),uuid4(),uuid4(),uuid4();connection=psycopg.connect(self.url)
+        with connection.cursor() as cursor:
+            cursor.execute("INSERT INTO organizations(id,name) VALUES(%s,%s)",(org,f"RLS default {org}"))
+            set_tenant(cursor,org,current);cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'Current','Current')",(current,org))
+            set_tenant(cursor,org,default);cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'Default Company','Default Company')",(default,org))
+            cursor.execute("INSERT INTO ledger_mappings(id,organization_id,company_id,tool,platform,pattern,ledger,match_type) VALUES(%s,%s,%s,'bank','','Inherited only','Default Ledger','contains')",(uuid4(),org,default))
+        connection.commit();connection.close();repository=PostgresRepositories(tenant_factory(self.url,org,current,user),org)
+        self.assertEqual(repository.map_ledger("Current","bank","","Inherited only"),("Suspense","UNMATCHED_TO_SUSPENSE"))
 
 
 if __name__ == "__main__":

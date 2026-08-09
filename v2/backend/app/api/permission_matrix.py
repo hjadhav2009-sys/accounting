@@ -1,0 +1,55 @@
+from __future__ import annotations
+
+from ..domain.enums import Permission
+
+
+# Auditable capability contract for every non-authenticated/public V2 API route.
+# Route modules enforce these through permission_dependency or their tenant-scoped
+# service authorization boundary; the regression suite rejects uncatalogued routes.
+API_PERMISSION_MATRIX:dict[tuple[str,str],Permission]={
+    ("GET","/api/v2/admin/health"):Permission.USER_ADMIN,
+    ("GET","/api/v2/admin/users"):Permission.USER_ADMIN,
+    ("POST","/api/v2/admin/users"):Permission.USER_ADMIN,
+    ("POST","/api/v2/admin/users/{user_id}/disable"):Permission.USER_ADMIN,
+    ("POST","/api/v2/admin/users/{user_id}/reactivate"):Permission.USER_ADMIN,
+    ("PUT","/api/v2/admin/users/{user_id}/role"):Permission.USER_ADMIN,
+    ("POST","/api/v2/admin/users/{user_id}/revoke-sessions"):Permission.USER_ADMIN,
+    ("POST","/api/v2/admin/users/{user_id}/reset-password"):Permission.USER_ADMIN,
+    ("GET","/api/v2/masters"):Permission.DOCUMENT_VIEW,
+    ("POST","/api/v2/masters/bank-accounts"):Permission.COMPANY_ADMIN,
+    ("POST","/api/v2/masters/party-ledgers"):Permission.COMPANY_ADMIN,
+    ("POST","/api/v2/masters/gst-ledgers"):Permission.COMPANY_ADMIN,
+    ("POST","/api/v2/masters/voucher-rules"):Permission.COMPANY_ADMIN,
+    ("GET","/api/v2/masters/mappings/export"):Permission.MAPPING_EDIT,
+    ("POST","/api/v2/masters/mappings/import-preview"):Permission.MAPPING_EDIT,
+    ("POST","/api/v2/masters/mappings/import/{preview_id}/apply"):Permission.MAPPING_EDIT,
+    ("POST","/api/v2/phase6c/documents/{document_id}/execute"):Permission.DOCUMENT_REVIEW,
+    ("GET","/api/v2/phase6c/parity"):Permission.DOCUMENT_VIEW,
+    ("GET","/api/v2/phase6c/parity/{run_id}"):Permission.DOCUMENT_VIEW,
+    ("POST","/api/v2/phase6c/migration/preview"):Permission.COMPANY_ADMIN,
+    ("GET","/api/v2/phase6c/migration/previews"):Permission.COMPANY_ADMIN,
+    ("POST","/api/v2/phase6c/migration/{preview_id}/apply"):Permission.COMPANY_ADMIN,
+    ("GET","/api/v2/templates"):Permission.DOCUMENT_VIEW,
+    ("POST","/api/v2/templates/families"):Permission.TEMPLATE_CREATE,
+    ("GET","/api/v2/templates/families/{family_id}"):Permission.DOCUMENT_VIEW,
+    ("POST","/api/v2/templates/versions/{version_id}/clone"):Permission.TEMPLATE_CREATE,
+    ("GET","/api/v2/templates/versions/{version_id}"):Permission.DOCUMENT_VIEW,
+    ("PUT","/api/v2/templates/versions/{version_id}"):Permission.TEMPLATE_CREATE,
+    ("POST","/api/v2/templates/versions/{version_id}/actions"):Permission.TEMPLATE_CREATE,
+    ("POST","/api/v2/templates/versions/{version_id}/preview"):Permission.TEMPLATE_CREATE,
+    ("GET","/api/v2/templates/versions/{version_id}/samples"):Permission.DOCUMENT_VIEW,
+    ("POST","/api/v2/templates/versions/{version_id}/samples"):Permission.TEMPLATE_CREATE,
+    ("DELETE","/api/v2/templates/versions/{version_id}/samples/{document_id}"):Permission.TEMPLATE_CREATE,
+    ("POST","/api/v2/templates/versions/{version_id}/test-all"):Permission.TEMPLATE_CREATE,
+    ("GET","/api/v2/template-test-runs/{run_id}"):Permission.DOCUMENT_VIEW,
+    ("POST","/api/v2/templates/versions/{version_id}/approve"):Permission.TEMPLATE_APPROVE,
+    ("POST","/api/v2/templates/versions/{version_id}/deprecate"):Permission.TEMPLATE_APPROVE,
+    ("GET","/api/v2/templates/versions/{version_id}/export"):Permission.DOCUMENT_VIEW,
+    ("POST","/api/v2/templates/import"):Permission.TEMPLATE_CREATE,
+    ("GET","/api/v2/templates/diff"):Permission.DOCUMENT_VIEW,
+    ("POST","/api/v2/template-studio/from-document"):Permission.TEMPLATE_CREATE,
+    ("POST","/api/v2/templates/versions/{version_id}/selection-context"):Permission.TEMPLATE_CREATE,
+    ("POST","/api/v2/templates/routing-diagnostic"):Permission.DOCUMENT_VIEW,
+    ("GET","/api/v2/templates/routing-diagnostic/{document_id}"):Permission.DOCUMENT_VIEW,
+    ("POST","/api/v2/templates/families/{family_id}/comments"):Permission.TEMPLATE_CREATE,
+}

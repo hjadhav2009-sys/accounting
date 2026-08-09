@@ -11,6 +11,7 @@ from ..config import get_settings
 from ..document_intelligence.models import to_jsonable
 from ..domain.enums import Permission, Role
 from ..infrastructure.postgres import psycopg_tenant_connection_factory
+from ..infrastructure.shadow_migration import file_sha256
 from ..phase6c import ExecutionMode, IndependentParityCoordinator
 from ..phase6c.repository import Phase6CRepository
 from ..phase6c.sqlite_migration import ExistingDataMigration, EXPECTED_SQLITE_SHA256
@@ -102,10 +103,12 @@ def migration_apply(preview_id: UUID, context: Annotated[RequestContext, Depends
     if not preview: raise HTTPException(404, "Migration preview not found")
     if preview["status"] != "PREVIEW": raise HTTPException(409, "Migration preview is stale or already applied")
     if not preview["report"].get("apply_allowed"): raise HTTPException(409, "Migration preview contains blockers")
-    if preview["source_sha256"] != EXPECTED_SQLITE_SHA256: raise HTTPException(409, "Source hash is not certified")
+    if preview["source_file"] != str(SQLITE_SOURCE): raise HTTPException(409, "Migration source does not match this preview")
+    if file_sha256(SQLITE_SOURCE) != preview["source_sha256"]: raise HTTPException(409, "SQLite changed after preview; run validation preview again")
     connection = _factory(context)()
     try:
-        report = ExistingDataMigration(connection, context.organization_id, SQLITE_SOURCE).apply("Existing Business Automation Data")
+        report = ExistingDataMigration(connection, context.organization_id, SQLITE_SOURCE,
+            preview["source_sha256"]).apply("Existing Business Automation Data",preview["source_sha256"])
     finally: connection.close()
     role_code="OWNER" if Role.OWNER in context.roles else "ADMIN"
     report["company_access_granted"]=repository.grant_imported_company_access(context.organization_id,context.user_id,

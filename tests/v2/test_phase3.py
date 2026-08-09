@@ -17,7 +17,7 @@ from v2.backend.app.document_intelligence.pipeline import DocumentIntakeService
 from v2.backend.app.document_intelligence.repository import DocumentRepository
 from v2.backend.app.document_intelligence.security import DocumentSecurityError, ResourceLimits, safe_filename, validate_pdf_upload
 from v2.backend.app.document_intelligence.status_machine import DocumentStatusMachine, InvalidDocumentTransition
-from v2.backend.app.document_intelligence.validation import AccountingValidationEngine, InvoiceTotalValidator, QuantityValidator, TaxBucketValidator
+from v2.backend.app.document_intelligence.validation import AccountingValidationEngine, InvoiceTotalValidator, QuantityValidator, TaxBucketValidator,taxable_base_total
 from v2.backend.app.services.storage import LocalFilesystemStorage
 from tests.v2.rls_support import set_tenant, tenant_factory
 
@@ -152,6 +152,15 @@ class StateAndValidationTests(unittest.TestCase):
         )}
         self.assertFalse(InvoiceTotalValidator().validate(payload))
 
+    def test_identical_taxable_lines_remain_distinct_base_partitions(self):
+        buckets=[]
+        for partition in ("line-1","line-2"):
+            buckets.extend(({"base_partition_id":partition,"tax_type":"CGST","rate":"9","taxable":"100","tax":"9","hsn_sac":"1"},
+                            {"base_partition_id":partition,"tax_type":"SGST","rate":"9","taxable":"100","tax":"9","hsn_sac":"1"}))
+        self.assertEqual(taxable_base_total(buckets),Decimal("200.00"))
+        report=AccountingValidationEngine((InvoiceTotalValidator(),)).validate({"tax_buckets":buckets,"invoice_total":"236"})
+        self.assertEqual(report.status,"VERIFIED");self.assertEqual(report.calculations["taxable_total"],"200.00")
+
     def test_quantity_mismatch_blocks(self):
         finding = QuantityValidator().validate({"displayed_total_quantity": "3", "items": ({"quantity": "1"},)})[0]
         self.assertEqual(finding.severity, Severity.BLOCKING)
@@ -191,16 +200,16 @@ class Phase3PostgreSQLRuntimeTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def test_known_legacy_pdf_verifies_and_exact_hash_deduplicates(self):
+    def test_normal_v2_path_creates_draft_and_exact_hash_deduplicates_without_reference_parser(self):
         content = pdf_with_text(SUJAL_TEXT)
         first = self.service.process(self.context, "synthetic-sujal.pdf", "application/pdf", content)
-        self.assertEqual(first["status"], "VERIFIED")
+        self.assertEqual(first["status"], "REVIEW");self.assertEqual(first["draft_template"]["status"],"DRAFT")
         duplicate = self.service.process(self.context, "renamed.pdf", "application/pdf", content)
         self.assertTrue(duplicate["duplicate"])
         self.assertEqual(duplicate["document_id"], first["document_id"])
         record = self.repository.get(self.organization_id, self.company_id, first["document_id"])
-        self.assertEqual(record["extraction_method"], ExtractionMethod.LEGACY_PARSER.value)
-        self.assertEqual(record["total_amount"], Decimal("4592.00"))
+        self.assertEqual(record["extraction_method"], ExtractionMethod.NATIVE_TEXT.value)
+        self.assertIsNone(record["total_amount"])
 
     def test_business_duplicate_unknown_and_scanned_routes_create_review(self):
         first = self.service.process(self.context, "first.pdf", "application/pdf", pdf_with_text(SUJAL_TEXT))

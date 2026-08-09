@@ -10,6 +10,8 @@ from .engine import TemplateRuleEngine
 from .models import StudioContext, TemplateImmutable, TemplateInvalid, TemplatePermissionDenied
 from .repository import TemplateRepository
 from .schema import ENGINES, VALIDATION_PROFILES, empty_definition, sanitized_export, validate_definition
+from ..document_intelligence.validation import (AccountingValidationEngine,BankBalanceValidator,InvoiceTotalValidator,
+    LineAmountValidator,QuantityValidator,RequiredFieldValidator,TaxBucketValidator)
 
 
 CREATE_ROLES = {"OWNER", "ADMIN", "REVIEWER"}
@@ -148,18 +150,35 @@ class TemplateStudioService:
         fields = {item["field"]: item.get("value") for item in extraction.get("fields", [])}
         requirements = {
             "INVOICE": ("invoice_number", "invoice_date", "invoice_total"),
-            "MARKETPLACE": ("invoice_number", "document_type"),
+            "MARKETPLACE": ("invoice_number", "document_type", "invoice_total"),
             "BANK": ("opening_balance", "closing_balance"),
-            "STOCK_TRANSFER": ("reference_number",), "GENERIC": (),
+            "STOCK_TRANSFER": ("reference_number", "invoice_total"), "GENERIC": (),
         }.get(profile, ())
-        findings = [{"code": "REQUIRED_FIELD", "severity": "BLOCKING", "field": name,
-                     "message": f"Required field '{name}' is not extracted"} for name in requirements if not fields.get(name)]
-        if profile == "INVOICE" and extraction.get("tax_buckets"):
-            rates = [row.get("values", {}).get("gst_rate") for row in extraction["tax_buckets"]]
-            if len([rate for rate in rates if rate]) != len(set(rate for rate in rates if rate)):
-                findings.append({"code": "TAX_BUCKET_DUPLICATE", "severity": "REVIEW", "message": "Tax bucket rates repeat; rows remain separate"})
-        status = "BLOCKED" if any(item["severity"] == "BLOCKING" for item in findings) else ("REVIEW" if findings else "VERIFIED")
-        return {"status": status, "profile": profile, "findings": findings, "checks": {"required_fields": not any(item["code"] == "REQUIRED_FIELD" for item in findings)}}
+        items=[dict(row.get("values") or {}) for row in extraction.get("item_rows",[])]
+        tax_buckets=[]
+        for index,row in enumerate(extraction.get("tax_buckets",[])):
+            values=dict(row.get("values") or {})
+            tax_buckets.append({"tax_type":values.get("tax_type") or values.get("gst_type"),
+                "rate":values.get("gst_rate") or values.get("rate"),"taxable":values.get("taxable"),
+                "tax":values.get("tax_amount") or values.get("tax"),"hsn_sac":values.get("hsn_sac") or values.get("hsn"),
+                "base_partition_id":values.get("base_partition_id") or f"template-row:{index}"})
+        bank_rows=[dict(row.get("values") or {}) for table in extraction.get("tables",[]) if table.get("table_type")=="BANK" for row in table.get("rows",[])]
+        payload={**fields,"items":items,"tax_buckets":tax_buckets,
+            "displayed_total_quantity":fields.get("displayed_total_quantity"),"invoice_total":fields.get("invoice_total"),
+            "taxable_total":fields.get("taxable_total"),"adjustments":fields.get("adjustments"),"round_off":fields.get("round_off"),
+            "opening_balance":fields.get("opening_balance"),"closing_balance":fields.get("closing_balance"),
+            "bank_transactions":[{"credit":row.get("credit") or row.get("deposit"),"debit":row.get("debit") or row.get("withdrawal"),
+                "balance":row.get("balance"),"narration":row.get("narration") or row.get("description")} for row in bank_rows]}
+        validators=[RequiredFieldValidator(requirements)]
+        if profile in {"INVOICE","MARKETPLACE","STOCK_TRANSFER"}:validators.extend((QuantityValidator(),LineAmountValidator(),TaxBucketValidator(),InvoiceTotalValidator()))
+        if profile=="BANK":validators.append(BankBalanceValidator())
+        report=AccountingValidationEngine(tuple(validators)).validate(payload)
+        findings=[{"code":item.error_code.value if item.error_code else item.validator,"severity":item.severity.value,
+            "message":item.message,"field":item.message.rsplit(": ",1)[-1] if item.validator=="RequiredFieldValidator" else None,
+            "expected":item.expected,"actual":item.actual,"difference":item.difference} for item in report.findings]
+        return {"status":report.status,"profile":profile,"findings":findings,"calculations":report.calculations,
+            "checks":{"required_fields":not any(item.validator=="RequiredFieldValidator" for item in report.findings),
+                "canonical_accounting_engine":True}}
 
     def run_all_samples(self, context: StudioContext, version_id: UUID) -> dict[str, Any]:
         run_id = self.queue_test_run(context, version_id)

@@ -16,6 +16,10 @@ class DocumentRepository:
     def __init__(self, connect: Callable[[], Any]) -> None:
         self._connect = connect
 
+    @property
+    def connection_factory(self)->Callable[[],Any]:
+        return self._connect
+
     @contextmanager
     def _cursor(self):
         connection = self._connect()
@@ -42,6 +46,15 @@ class DocumentRepository:
             )
             row = cursor.fetchone()
             return row[0] if row else None
+
+    def record_duplicate_attempt(self, organization_id:UUID, company_id:UUID, existing_document_id:UUID,
+                                 attempted_by:UUID, sha256:str, original_filename:str)->None:
+        """Persist audit evidence only; a duplicate source object is never stored."""
+        with self._cursor() as cursor:
+            cursor.execute("""INSERT INTO duplicate_upload_attempts(id,organization_id,company_id,
+                existing_document_id,attempted_by,sha256,original_filename)
+                VALUES(%s,%s,%s,%s,%s,%s,%s)""",(uuid4(),organization_id,company_id,
+                existing_document_id,attempted_by,sha256,original_filename[:500]))
 
     def create(self, record: DocumentRecord) -> None:
         with self._cursor() as cursor:
@@ -195,7 +208,7 @@ class DocumentRepository:
                 cursor.execute("""INSERT INTO template_versions(id,family_id,version,status,definition,created_by,approved_by,approved_at,
                     engine,validation_profile,updated_by)
                     VALUES(%s,%s,1,'APPROVED',%s::jsonb,%s,%s,now(),'LEGACY_PARSER','GENERIC',%s)""",
-                    (template_id, family_id, json.dumps({"route": route, "adapter": "certified-legacy"}),
+                    (template_id, family_id, json.dumps({"route": route, "adapter": "v2-native-template"}),
                      record.created_by, record.created_by, record.created_by))
             cursor.execute("UPDATE format_fingerprints SET family_id=%s WHERE organization_id=%s AND document_id=%s",
                            (family_id, record.organization_id, record.document_id))
@@ -481,14 +494,14 @@ class DocumentRepository:
                 "document_count": 0, "taxable": Decimal("0"), "CGST": Decimal("0"),
                 "SGST": Decimal("0"), "IGST": Decimal("0"), "total_gst": Decimal("0"), "invoice_total": Decimal("0")})
             group["document_count"] += 1
-            seen_taxable: set[tuple[str, str, Decimal]] = set()
+            from .validation import taxable_base_total
+            buckets=payload.get("tax_buckets") or []
             for bucket in payload.get("tax_buckets") or []:
                 taxable = Decimal(str(bucket.get("taxable") or 0)); tax = Decimal(str(bucket.get("tax") or 0))
-                seen_taxable.add((str(bucket.get("rate") or ""), str(bucket.get("hsn_sac") or ""), taxable))
                 tax_type = str(bucket.get("tax_type") or "").upper()
                 if tax_type in {"CGST", "SGST", "IGST"}: group[tax_type] += tax
                 group["total_gst"] += tax
-            group["taxable"] += sum((item[2] for item in seen_taxable), Decimal("0"))
+            group["taxable"] += taxable_base_total(buckets)
             group["invoice_total"] += Decimal(str((payload.get("totals") or {}).get("invoice_total") or 0))
         return list(groups.values())
 
@@ -512,7 +525,8 @@ class DocumentRepository:
                            [organization_id, company_id, *invoice_dates])
             invoice_count, invoice_total = cursor.fetchone()
             cursor.execute("""SELECT coalesce(sum(taxable),0) FROM (
-                SELECT DISTINCT b.invoice_id,b.rate,b.hsn_sac,b.taxable FROM invoice_tax_buckets b
+                SELECT DISTINCT b.invoice_id,coalesce(nullif(b.base_partition_id,''),
+                    b.rate::text||'|'||b.hsn_sac||'|'||b.taxable::text) partition_id,b.taxable FROM invoice_tax_buckets b
                 JOIN invoices i ON i.id=b.invoice_id WHERE i.organization_id=%s AND i.company_id=%s""" + invoice_suffix +
                 ") partitions", [organization_id, company_id, *invoice_dates])
             taxable = cursor.fetchone()[0]

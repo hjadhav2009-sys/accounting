@@ -11,7 +11,6 @@ from uuid import uuid4
 
 from ..services.storage import DocumentStorage
 from .fingerprint import create_format_fingerprint
-from .legacy_adapter import normalize_legacy_pdf
 from .models import (
     DocumentRecord, DocumentStatus, ErrorCode, ExtractionMethod, ExtractionQuality,
     IntakeContext, NormalizedExtractionResult, ReviewReason,
@@ -26,6 +25,9 @@ from .routing import KnownFormatRouter
 from .security import DocumentSecurityError, ResourceLimits, validate_pdf_upload
 from .status_machine import DocumentStatusMachine
 from .validation import AccountingValidationEngine, RequiredFieldValidator
+from ..phase6c.repository import Phase6CRepository
+from ..phase6c.v2_native import _canonical, _evidence
+from ..template_studio.engine import TemplateRuleEngine
 
 
 class DocumentIntakeService:
@@ -36,6 +38,19 @@ class DocumentIntakeService:
         self.quality = ExtractionQualityAssessor()
         self.router = KnownFormatRouter()
         self.machine = DocumentStatusMachine()
+
+    def _approved_v2_result(self, context:IntakeContext, document_id, pages, assessment, fingerprint):
+        template=Phase6CRepository(self.repository.connection_factory).approved_template(
+            context.organization_id,context.company_id,fingerprint.signature)
+        if not template:return None
+        extracted=TemplateRuleEngine().extract(template["definition"],_evidence(pages));canonical=_canonical(extracted)
+        return NormalizedExtractionResult(document_id,ExtractionMethod.NATIVE_TEXT,pages,
+            document_type=canonical.get("document_type"),supplier=canonical.get("supplier"),
+            invoice_number=canonical.get("invoice_number"),invoice_date=canonical.get("date"),
+            items=tuple(canonical.get("rows") or ()),tax_buckets=tuple(canonical.get("tax_buckets") or ()),
+            totals={key:canonical.get(key) for key in ("subtotal","round_off","invoice_total") if canonical.get(key) is not None},
+            warnings=(f"Approved V2 Template v{template['version']}",),quality=assessment,fingerprint=fingerprint,
+            format_family_id=None,template_version_id=template["id"])
 
     def _move(self, record: DocumentRecord, target: DocumentStatus, **values) -> DocumentRecord:
         self.machine.transition(record.status, target)
@@ -50,6 +65,8 @@ class DocumentIntakeService:
         digest = hashlib.sha256(content).hexdigest()
         duplicate_id = self.repository.exact_duplicate(context.organization_id, context.company_id, digest)
         if duplicate_id:
+            self.repository.record_duplicate_attempt(context.organization_id,context.company_id,duplicate_id,
+                                                     context.user_id,digest,filename)
             return {"document_id": duplicate_id, "sha256": digest, "duplicate": True,
                     "status": DocumentStatus.DUPLICATE.value}
         document_id = uuid4()
@@ -132,12 +149,12 @@ class DocumentIntakeService:
                 route = self.router.route(combined_text, filename, combined_assessment.status, fingerprint)
                 warnings = (f"OCR processed pages {','.join(map(str, ocr_page_numbers))} and produced {len(ocr_fields)} tokens",
                             f"{ambiguity_count} tokens contain possible digit/letter ambiguity; originals were retained")
-                if route.route.startswith("legacy_pdf:"):
-                    template = route.route.split(":", 1)[1]
-                    parsed = normalize_legacy_pdf(document_id, template, combined_text, safe_name,
-                                                  combined_pages, combined_assessment, fingerprint)
-                    result = replace(parsed, method=ExtractionMethod.LOCAL_OCR, fields=ocr_fields,
-                                     warnings=warnings + parsed.warnings)
+                approved=self._approved_v2_result(context,document_id,combined_pages,combined_assessment,fingerprint)
+                if approved:
+                    route=replace(route,route=f"v2_template:{approved.template_version_id}",known=True,
+                                  reason="Approved company-scoped V2 template matched")
+                    result=replace(approved,method=ExtractionMethod.LOCAL_OCR,fields=ocr_fields,
+                                   warnings=warnings+approved.warnings)
                 else:
                     result = NormalizedExtractionResult(document_id, ExtractionMethod.LOCAL_OCR, combined_pages,
                         fields=ocr_fields, warnings=warnings + (route.reason,),
@@ -145,13 +162,15 @@ class DocumentIntakeService:
                 self.repository.save_metric(replace(record, extraction_method=ExtractionMethod.LOCAL_OCR),
                                             "OCR", round((perf_counter() - ocr_started) * 1000),
                                             "COMPLETED", ocr_pages=len(ocr_page_numbers), format_route=route.route)
-            elif route.route.startswith("legacy_pdf:"):
-                template = route.route.split(":", 1)[1]
-                result = normalize_legacy_pdf(document_id, template, text, safe_name, pages, assessment, fingerprint)
             else:
-                result = NormalizedExtractionResult(document_id, ExtractionMethod.NATIVE_TEXT, pages,
-                    quality=assessment, fingerprint=fingerprint,
-                    warnings=(route.reason,))
+                approved=self._approved_v2_result(context,document_id,pages,assessment,fingerprint)
+                if approved:
+                    route=replace(route,route=f"v2_template:{approved.template_version_id}",known=True,
+                                  reason="Approved company-scoped V2 template matched")
+                    result=approved
+                else:
+                    result = NormalizedExtractionResult(document_id, ExtractionMethod.NATIVE_TEXT, pages,
+                        quality=assessment, fingerprint=fingerprint,warnings=(route.reason,))
             invoice_total = result.totals.get("invoice_total")
             record = self._move(record, DocumentStatus.EXTRACTED, page_count=len(pages),
                                 extraction_method=result.method, quality_status=assessment.status,
@@ -164,9 +183,15 @@ class DocumentIntakeService:
             extraction_id = self.repository.save_extraction(record, result, "phase3-foundation-v1")
             if not route.known:
                 record = self._move(record, DocumentStatus.REVIEW, error_code=ErrorCode.FORMAT_UNKNOWN)
+                draft=Phase6CRepository(self.repository.connection_factory).ensure_v2_draft(
+                    context.organization_id,context.company_id,document_id,context.user_id,fingerprint.signature)
                 self.repository.create_review(record, ReviewReason.UNKNOWN_FORMAT.value,
-                                              detail={"route": route.route, "fingerprint": fingerprint.signature})
-                return self._result(record, digest, started)
+                                              detail={"route": route.route, "fingerprint": fingerprint.signature,
+                                                      "draft_template":draft})
+                if low_confidence_critical:
+                    self.repository.create_review(record,ReviewReason.OCR_LOW_CONFIDENCE.value,
+                                                  detail={"policy":"critical numeric OCR token below MEDIUM tier"})
+                response=self._result(record,digest,started);response["draft_template"]=draft;return response
             business_values = (record.supplier, record.document_type, record.invoice_number,
                                record.invoice_date, record.total_amount)
             if all(value not in (None, "") for value in business_values):

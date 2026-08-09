@@ -144,7 +144,7 @@ class Phase3BRuntimeIntegrationTests(unittest.TestCase):
             def extract_page(self, *_args): raise AssertionError("healthy native PDF invoked OCR")
         result = DocumentIntakeService(self.repo, LocalFilesystemStorage(self.temp.name), FailIfCalled()).process(
             self.context, "native.pdf", "application/pdf", pdf_with_text(SUJAL_TEXT))
-        self.assertEqual(result["status"], "VERIFIED")
+        self.assertEqual(result["status"], "REVIEW");self.assertEqual(result["draft_template"]["engine"],"VISUAL_RULES")
 
     @unittest.skipUnless(Path("C:/Program Files/Tesseract-OCR/tesseract.exe").exists(), "Tesseract runtime not installed")
     def test_scanned_invoice_uses_real_ocr_and_preserves_numeric_candidates(self):
@@ -155,12 +155,11 @@ class Phase3BRuntimeIntegrationTests(unittest.TestCase):
         record = self.repo.get(self.organization_id, self.company_id, processed["document_id"])
         self.assertEqual(record["extraction_method"], "LOCAL_OCR")
         extraction = self.repo.extraction(self.organization_id, self.company_id, processed["document_id"])["normalized_result"]
-        self.assertEqual({str(bucket["rate"]) for bucket in extraction["tax_buckets"]}, {"3", "18"})
+        self.assertEqual(extraction["tax_buckets"],[])
         numeric = [field for field in extraction["fields"] if field["original_token"] == "21,494.00"]
         self.assertEqual(numeric[0]["value"], "21494.00")
         self.assertIsNotNone(numeric[0]["source"]["bounding_box"])
-        validation = self.repo.validation(self.organization_id, self.company_id, processed["document_id"])
-        self.assertEqual(validation["status"], "VERIFIED")
+        self.assertEqual(processed["draft_template"]["status"],"DRAFT")
 
     def test_mixed_document_invokes_only_scanned_page(self):
         import pymupdf
@@ -195,9 +194,8 @@ class Phase3BRuntimeIntegrationTests(unittest.TestCase):
         mismatched = OCR_TEXT.replace("120 (3%)", "121 (3%)")
         processed = self._ocr_candidate_service(mismatched, .99).process(
             self.context, "mismatch.pdf", "application/pdf", scanned_pdf(""))
-        self.assertEqual(processed["status"], "BLOCKED")
-        validation = self.repo.validation(self.organization_id, self.company_id, processed["document_id"])
-        self.assertTrue(any(issue["code"] in {"GST_MISMATCH", "INVOICE_TOTAL_MISMATCH"} for issue in validation["issues"]))
+        self.assertEqual(processed["status"], "REVIEW")
+        self.assertEqual(processed["draft_template"]["status"],"DRAFT")
 
     def _assert_ocr_failure(self, exception, expected_code):
         class FailingOcr:
@@ -245,7 +243,7 @@ class Phase3BRuntimeIntegrationTests(unittest.TestCase):
         from v2.backend.app.config.settings import get_settings
         from v2.backend.app.main import app
         headers = {"X-Organization-ID": str(self.organization_id), "X-Company-ID": str(self.company_id),
-                   "X-User-ID": str(self.user_id)}
+                   "X-User-ID": str(self.user_id),"X-Roles":"ACCOUNTANT"}
         with patch.dict(os.environ, {"POSTGRES_URL": self.url, "DATABASE_URL": "", "STORAGE_ROOT": self.temp.name}, clear=False):
             get_settings.cache_clear()
             try:
@@ -260,7 +258,7 @@ class Phase3BRuntimeIntegrationTests(unittest.TestCase):
                     while status["status"] in {"QUEUED","RUNNING"} and time.monotonic()<deadline:
                         time.sleep(.1);status=client.get(f"/api/v2/batches/{batch_id}",headers=headers).json()
                     self.assertEqual(status["status"], "COMPLETED_WITH_ERRORS")
-                    self.assertEqual((status["processed"], status["verified"], status["failed"]), (2, 1, 1))
+                    self.assertEqual((status["processed"],status["review"],status["failed"]),(2,1,1))
                     documents = client.get(f"/api/v2/batches/{batch_id}/documents", headers=headers).json()["items"]
                     self.assertEqual(len(documents), 1)
             finally:

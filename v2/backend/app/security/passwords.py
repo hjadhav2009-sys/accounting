@@ -9,6 +9,7 @@ from argon2.exceptions import InvalidHashError, VerifyMismatchError
 _HASHER = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4,
                          hash_len=32, salt_len=16, type=Type.ID)
 _COMMON = {"password", "password123", "admin123", "qwerty123", "letmein123"}
+_DUMMY_HASH = _HASHER.hash("Synthetic-Dummy-Password!9")
 
 
 class PasswordPolicyError(ValueError):
@@ -42,5 +43,6 @@ def verify_password(encoded: str, password: str) -> tuple[bool, bool]:
 
 
 def dummy_verify(password: str) -> None:
-    # Keeps the unknown-user path computationally similar without storing a secret.
-    _HASHER.verify(_HASHER.hash("Synthetic-Dummy-Password!9"), password)
+    # Precomputed once: unknown identifiers cannot force an extra Argon2 hash per request.
+    try:_HASHER.verify(_DUMMY_HASH,password)
+    except VerifyMismatchError:pass

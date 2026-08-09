@@ -23,10 +23,14 @@ foreach ($property in $state.PSObject.Properties) {
     $command = if ($cim) { [string]$cim.CommandLine } else { '' }
     $actualExecutable = if ($cim) { [string]$cim.ExecutablePath } else { '' }
     $expectedExecutable = [System.IO.Path]::GetFullPath([string]$record.executable)
-    $ownedCommand = $command.IndexOf($projectRoot,[System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    $actualHash = if ($command) { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($command))) } else { '' }
+    $creationTime = $process.StartTime.ToUniversalTime().ToString('o')
+    $ownedCommand = $command.IndexOf([string]$record.project_marker,[System.StringComparison]::OrdinalIgnoreCase) -ge 0
     $ownedExecutable = $actualExecutable -and ([System.IO.Path]::GetFullPath($actualExecutable) -eq $expectedExecutable)
-    if (-not ($ownedCommand -or $ownedExecutable)) {
-        Write-Warning "Refused to stop PID $($record.pid): its command line is not owned by this project."
+    $sameCreation = $creationTime -eq [string]$record.creation_time
+    $sameCommand = $actualHash -and $actualHash -eq [string]$record.command_hash
+    if (-not ($ownedCommand -and $ownedExecutable -and $sameCreation -and $sameCommand)) {
+        Write-Warning "Refused to stop PID $($record.pid): executable, creation time, project marker, and command hash did not all match."
         continue
     }
     Stop-OwnedTree ([int]$record.pid)

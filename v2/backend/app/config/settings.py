@@ -9,6 +9,10 @@ from decimal import Decimal
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_STORAGE_ROOT = REPOSITORY_ROOT / "v2_data" / "documents"
+CLOUDFLARE_MODEL_ALLOWLIST = frozenset({
+    "@cf/zai-org/glm-4.7-flash",
+    "@cf/google/gemma-4-26b-a4b-it",
+})
 
 
 @dataclass(frozen=True)
@@ -81,6 +85,10 @@ class Settings:
         if not cloud_secret and cloud_secret_file:
             try: cloud_secret = Path(cloud_secret_file).read_text(encoding="utf-8").strip()
             except OSError: cloud_secret = ""
+        text_model=os.getenv("CLOUDFLARE_AI_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
+        vision_model=os.getenv("CLOUDFLARE_AI_VISION_MODEL", "@cf/google/gemma-4-26b-a4b-it").strip()
+        if text_model not in CLOUDFLARE_MODEL_ALLOWLIST or vision_model not in CLOUDFLARE_MODEL_ALLOWLIST:
+            raise ValueError("configured Cloudflare model is not allowlisted by this release")
         return cls(
             environment=os.getenv("APP_ENV", "development").strip().lower(),
             database_adapter_mode=os.getenv("DATABASE_ADAPTER_MODE", "LEGACY_SQLITE").strip().upper(),
@@ -101,8 +109,8 @@ class Settings:
             cloudflare_ai_worker_url=os.getenv("CLOUDFLARE_AI_WORKER_URL", "").strip(),
             cloudflare_ai_worker_hmac_secret=cloud_secret,
             cloudflare_ai_worker_hmac_secret_file=cloud_secret_file,
-            cloudflare_ai_model=os.getenv("CLOUDFLARE_AI_MODEL", "@cf/zai-org/glm-4.7-flash").strip(),
-            cloudflare_ai_vision_model=os.getenv("CLOUDFLARE_AI_VISION_MODEL", "@cf/google/gemma-4-26b-a4b-it").strip(),
+            cloudflare_ai_model=text_model,
+            cloudflare_ai_vision_model=vision_model,
             ai_phase5_runtime_certified=os.getenv("AI_PHASE5_RUNTIME_CERTIFIED", "").strip().lower() in {"1", "true", "yes"},
             ai_daily_free_neurons=max(1, int(os.getenv("AI_DAILY_FREE_NEURONS", "10000"))),
             postgres_shadow_enabled=os.getenv("POSTGRES_SHADOW_ENABLED", "").strip().lower() in {"1", "true", "yes"},
@@ -157,6 +165,15 @@ class Settings:
             "postgres_connected": "unknown" if (self.database_url or self.postgres_url) else "false",
             "shadow_mode": "true" if self.postgres_shadow_enabled else "false",
         }
+
+    def validate_runtime_security(self) -> None:
+        if self.environment in {"development","test"}: return
+        problems=[]
+        if not self.production_auth_enabled:problems.append("PRODUCTION_AUTH_ENABLED must be true")
+        if not self.session_cookie_secure:problems.append("SESSION_COOKIE_SECURE must be true")
+        if not (self.database_url or self.postgres_url):problems.append("PostgreSQL authentication database is required")
+        if any(origin=="*" for origin in self.cors_origins):problems.append("wildcard CORS is forbidden")
+        if problems:raise RuntimeError("unsafe runtime configuration: "+"; ".join(problems))
 
 
 @lru_cache(maxsize=1)

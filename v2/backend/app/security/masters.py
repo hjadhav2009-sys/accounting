@@ -7,6 +7,7 @@ import zipfile
 import re
 from typing import Any
 from uuid import UUID,uuid4
+from ..domain.mapping import MATCH_TYPES,normalize_platform,normalize_text
 
 
 class MasterRepository:
@@ -109,12 +110,12 @@ class MasterRepository:
         rows=[];seen={};summary={"inserted":0,"updated":0,"unchanged":0,"invalid":0,"conflicts":0}
         for number,values_row in enumerate(values,start=2):
             if number>5001:workbook.close();raise ValueError("mapping workbook contains more than 5000 rows")
-            row=dict(zip(required,values_row));row={key:("" if value is None else value) for key,value in row.items()};row["tool"]=str(row["tool"]).strip().casefold();row["platform"]=str(row["platform"]).strip().casefold();row["pattern"]=str(row["pattern"]).strip();row["voucher_type"]=str(row["voucher_type"]).strip();row["ledger"]=str(row["ledger"]).strip();row["match_type"]=str(row["match_type"]).strip();row["priority"]=int(row["priority"] or 0);row["enabled"]=str(row["enabled"]).casefold() not in {"false","0","no","off"}
+            row=dict(zip(required,values_row));row={key:("" if value is None else value) for key,value in row.items()};row["tool"]=normalize_platform(row["tool"]);row["platform"]=normalize_platform(row["platform"]);row["pattern"]=normalize_text(row["pattern"]);row["voucher_type"]=normalize_text(row["voucher_type"]);row["ledger"]=normalize_text(row["ledger"]);row["match_type"]=normalize_text(row["match_type"]).casefold();row["priority"]=int(row["priority"] or 0);row["enabled"]=str(row["enabled"]).casefold() not in {"false","0","no","off"}
             errors=[]
             if row["tool"] not in {"marketplace","bank"}:errors.append("tool")
             if not row["pattern"]:errors.append("blank pattern")
             if not row["ledger"]:errors.append("blank ledger")
-            if row["match_type"] not in {"contains","smart_contains","equals","starts_with","regex"}:errors.append("match type")
+            if row["match_type"] not in MATCH_TYPES:errors.append("match type")
             if row["match_type"]=="regex":
                 try:re.compile(row["pattern"])
                 except re.error:errors.append("invalid regex")

@@ -8,7 +8,7 @@ from functools import lru_cache
 import os
 import atexit
 
-from shared.database import norm_platform, norm_text
+from ..domain.mapping import mapping_matches,normalize_platform as norm_platform,normalize_text as norm_text
 
 from ..domain.enums import JobStatus
 from ..domain.models import AuditEvent, DocumentIdentity, Job
@@ -130,15 +130,9 @@ class PostgresRepositories:
         return row[0] if row else None
 
     def _company_ids_with_default(self, cursor, company_name: str) -> list[UUID]:
-        names = [norm_text(company_name)]
-        if names[0] != "Default Company":
-            names.append("Default Company")
-        ids: list[UUID] = []
-        for name in names:
-            company_id = self._company_id(cursor, name)
-            if company_id is not None:
-                ids.append(company_id)
-        return ids
+        """V2 forced-RLS lookups are company-local; defaults must be copied explicitly."""
+        company_id=self._company_id(cursor,company_name)
+        return [company_id] if company_id is not None else []
 
     def list_bank_accounts(self, company_name: str) -> Sequence[dict[str, Any]]:
         with self._cursor() as cursor:
@@ -176,22 +170,21 @@ class PostgresRepositories:
                 return fallback, "UNMATCHED_TO_SUSPENSE"
             wanted_platform = norm_platform(platform)
             wanted_voucher = norm_text(voucher_type).lower()
-            lowered = str(description or "").lower()
             for company_id in company_ids:
                 cursor.execute(
-                    """SELECT pattern, ledger, platform, voucher_type FROM ledger_mappings
+                    """SELECT pattern, ledger, platform, voucher_type,match_type FROM ledger_mappings
                        WHERE organization_id=%s AND company_id=%s AND tool=%s AND enabled=true
                        ORDER BY length(pattern) DESC""",
                     (self.organization_id, company_id, norm_platform(tool)),
                 )
-                for pattern, ledger, row_platform, row_voucher in cursor.fetchall():
+                for pattern, ledger, row_platform, row_voucher,match_type in cursor.fetchall():
                     normalized_platform = norm_platform(row_platform)
                     if normalized_platform and wanted_platform and normalized_platform not in {wanted_platform, "all"}:
                         continue
                     normalized_voucher = norm_text(row_voucher).lower()
                     if normalized_voucher and wanted_voucher and normalized_voucher != wanted_voucher:
                         continue
-                    if pattern and pattern.lower() in lowered:
+                    if mapping_matches(description,pattern,match_type):
                         return norm_text(ledger) or fallback, pattern
         return fallback, "UNMATCHED_TO_SUSPENSE"
 

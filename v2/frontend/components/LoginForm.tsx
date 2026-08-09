@@ -2,14 +2,13 @@
 
 import { FormEvent,useState } from "react";
 import { useRouter } from "next/navigation";
+import { apiRequest } from "../lib/api";
 
 export function LoginForm(){
   const router=useRouter();const[busy,setBusy]=useState(false);const[message,setMessage]=useState("");
   async function submit(event:FormEvent<HTMLFormElement>){
     event.preventDefault();setBusy(true);setMessage("");const data=new FormData(event.currentTarget);
-    try{const response=await fetch(`${process.env.NEXT_PUBLIC_API_URL||"/backend"}/api/v2/auth/login`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({organization:data.get("organization"),email:data.get("email"),password:data.get("password")})});
-      const contentType=response.headers.get("content-type")||"";const body=contentType.includes("application/json")?await response.json():{};
-      if(!response.ok)throw new Error(response.status===401?"Email, password, or organization was not accepted.":"The sign-in service is temporarily unavailable. Try again.");
+    try{const body=await apiRequest<any>(`${process.env.NEXT_PUBLIC_API_URL||"/backend"}/api/v2/auth/login`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({organization:data.get("organization"),email:data.get("email"),password:data.get("password")})});
       window.sessionStorage.setItem("ba_csrf_token",body.csrf_token);window.sessionStorage.setItem("ba_session_info",JSON.stringify(body));router.push("/");router.refresh();
     }catch(error){setMessage(error instanceof Error?error.message:"Login failed. Try again.")}finally{setBusy(false)}
   }

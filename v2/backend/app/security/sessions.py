@@ -58,14 +58,17 @@ class SessionRepository:
         connection = self.connect()
         try:
             with connection.cursor() as cursor:
-                throttle_key=_digest(f"{realm.casefold()}\0{normalized}\0{remote_address}")
-                cursor.execute("""INSERT INTO auth_login_throttles(key_sha256) VALUES(%s)
-                    ON CONFLICT(key_sha256) DO UPDATE SET updated_at=now() RETURNING attempt_count,window_started_at,blocked_until""",(throttle_key,))
-                throttle=cursor.fetchone();now=datetime.now(timezone.utc)
-                if throttle[2] and throttle[2]>now:
+                throttle_keys=(_digest(f"identity\0{realm.casefold()}\0{normalized}\0{remote_address}"),
+                               _digest(f"network\0{remote_address or 'unknown'}"))
+                throttles=[];now=datetime.now(timezone.utc)
+                for throttle_key in throttle_keys:
+                    cursor.execute("""INSERT INTO auth_login_throttles(key_sha256) VALUES(%s)
+                        ON CONFLICT(key_sha256) DO UPDATE SET updated_at=now() RETURNING attempt_count,window_started_at,blocked_until""",(throttle_key,))
+                    throttle=cursor.fetchone();throttles.append(throttle)
+                    if throttle[1]<now-timedelta(minutes=15):
+                        cursor.execute("UPDATE auth_login_throttles SET attempt_count=0,window_started_at=now(),blocked_until=NULL WHERE key_sha256=%s",(throttle_key,))
+                if any(throttle[2] and throttle[2]>now for throttle in throttles):
                     connection.commit();raise AuthenticationFailed("invalid credentials")
-                if throttle[1]<now-timedelta(minutes=15):
-                    cursor.execute("UPDATE auth_login_throttles SET attempt_count=0,window_started_at=now(),blocked_until=NULL WHERE key_sha256=%s",(throttle_key,))
                 cursor.execute("""SELECT u.*,c.password_hash FROM users u
                     LEFT JOIN user_credentials c ON c.user_id=u.id
                     JOIN organizations o ON o.id=u.organization_id
@@ -75,12 +78,14 @@ class SessionRepository:
                 user = self._record(cursor, cursor.fetchone())
                 ambiguous = bool(user and not realm and cursor.fetchone())
                 if not user or ambiguous or not user.get("password_hash"):
-                    self._throttle_failure(cursor,throttle_key);connection.commit()
+                    for throttle_key in throttle_keys:self._throttle_failure(cursor,throttle_key)
+                    connection.commit()
                     try: from .passwords import dummy_verify; dummy_verify(password)
                     except Exception: pass
                     raise AuthenticationFailed("invalid credentials")
                 if user["status"] != "ACTIVE" or (user.get("locked_until") and user["locked_until"] > now):
-                    self._throttle_failure(cursor,throttle_key);connection.commit();raise AuthenticationFailed("invalid credentials")
+                    for throttle_key in throttle_keys:self._throttle_failure(cursor,throttle_key)
+                    connection.commit();raise AuthenticationFailed("invalid credentials")
                 valid, rehash = verify_password(user["password_hash"], password)
                 if not valid:
                     failures = int(user["failed_login_count"] or 0) + 1
@@ -89,7 +94,7 @@ class SessionRepository:
                                    (failures, locked, user["id"]))
                     self._event(cursor, user["organization_id"], user["id"],
                                 "ACCOUNT_LOCKED" if locked else "LOGIN_FAILED", remote_address)
-                    self._throttle_failure(cursor,throttle_key)
+                    for throttle_key in throttle_keys:self._throttle_failure(cursor,throttle_key)
                     connection.commit(); raise AuthenticationFailed("invalid credentials")
                 cursor.execute("SELECT set_config('app.organization_id',%s,true)",(str(user["organization_id"]),))
                 cursor.execute("SELECT set_config('app.company_id',%s,true)",(str(company_id or ""),))
@@ -117,7 +122,7 @@ class SessionRepository:
                      _digest(user_agent) if user_agent else None))
                 cursor.execute("UPDATE users SET failed_login_count=0,locked_until=NULL,last_login_at=%s WHERE id=%s",
                                (now,user["id"]))
-                cursor.execute("DELETE FROM auth_login_throttles WHERE key_sha256=%s",(throttle_key,))
+                cursor.execute("DELETE FROM auth_login_throttles WHERE key_sha256=ANY(%s)",(list(throttle_keys),))
                 self._event(cursor,user["organization_id"],user["id"],"LOGIN_SUCCEEDED",remote_address)
                 connection.commit()
                 identity=SessionIdentity(session_id,user["organization_id"],selected[0],user["id"],user["email"],

@@ -16,6 +16,7 @@ from .config.settings import REPOSITORY_ROOT
 
 
 settings = get_settings()
+settings.validate_runtime_security()
 configure_logging(REPOSITORY_ROOT,settings.log_max_bytes,settings.log_backup_count)
 
 
