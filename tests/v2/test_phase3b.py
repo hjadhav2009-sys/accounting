@@ -59,7 +59,11 @@ def scanned_pdf(text: str = OCR_TEXT, *, poor: bool = False, rotate: int = 0) ->
     import pymupdf
     from PIL import Image, ImageDraw, ImageFilter, ImageFont
     lines = text.splitlines(); image = Image.new("RGB", (1800, max(1400, len(lines) * 54 + 100)), "white")
-    draw = ImageDraw.Draw(image); font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 32)
+    draw = ImageDraw.Draw(image)
+    windows_font = Path("C:/Windows/Fonts/arial.ttf")
+    linux_font = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+    font_path = windows_font if windows_font.exists() else linux_font
+    font = ImageFont.truetype(str(font_path), 32) if font_path.exists() else ImageFont.load_default(size=32)
     for index, line in enumerate(lines): draw.text((70, 55 + index * 51), line, fill="#303030" if poor else "black", font=font)
     if poor: image = image.filter(ImageFilter.GaussianBlur(0.7))
     if rotate: image = image.rotate(rotate, expand=True, fillcolor="white")
