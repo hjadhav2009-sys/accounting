@@ -4,6 +4,9 @@ from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from typing import Any
 from uuid import UUID
+from functools import lru_cache
+import os
+import atexit
 
 from shared.database import norm_platform, norm_text
 
@@ -14,14 +17,67 @@ from ..domain.models import AuditEvent, DocumentIdentity, Job
 ConnectionFactory = Callable[[], Any]
 
 
+class _PooledConnection:
+    def __init__(self,pool,connection):self._pool=pool;self._connection=connection;self._returned=False
+    def __getattr__(self,name):return getattr(self._connection,name)
+    @property
+    def closed(self):return self._returned or self._connection.closed
+    def close(self):
+        if self._returned:return
+        try:
+            if not self._connection.closed:self._connection.rollback()
+        finally:self._pool.putconn(self._connection);self._returned=True
+
+
+@lru_cache(maxsize=8)
+def _connection_pool(database_url:str):
+    from psycopg_pool import ConnectionPool
+    minimum=max(0,int(os.getenv("POSTGRES_POOL_MIN_SIZE","1")));maximum=max(minimum or 1,int(os.getenv("POSTGRES_POOL_MAX_SIZE","10")))
+    return ConnectionPool(database_url,min_size=minimum,max_size=maximum,timeout=max(1,int(os.getenv("POSTGRES_POOL_TIMEOUT_SECONDS","10"))),open=True)
+
+
+def close_connection_pools()->None:
+    # lru_cache intentionally exposes no value iterator; configured URLs used by
+    # this process are tracked separately by the pool factory wrapper below.
+    for pool in tuple(_OPEN_POOLS):pool.close()
+    _OPEN_POOLS.clear();_connection_pool.cache_clear()
+
+
+_OPEN_POOLS:set[Any]=set()
+atexit.register(close_connection_pools)
+
+
 def psycopg_connection_factory(database_url: str) -> ConnectionFactory:
     if not database_url:
         raise ValueError("DATABASE_URL is required for PostgreSQL modes")
 
     def connect():
-        import psycopg
-        return psycopg.connect(database_url)
+        pool=_connection_pool(database_url);_OPEN_POOLS.add(pool)
+        return _PooledConnection(pool,pool.getconn())
 
+    return connect
+
+
+def psycopg_tenant_connection_factory(database_url: str, organization_id: UUID, company_id: UUID,
+                                      user_id: UUID | None = None) -> ConnectionFactory:
+    """Create an RLS-enforced application connection for one selected company.
+
+    The configured application login must be NOSUPERUSER and NOBYPASSRLS. Database
+    role provisioning is intentionally external to application migrations. The
+    transaction-local tenant settings are reset automatically on commit/rollback.
+    """
+    if not database_url: raise ValueError("DATABASE_URL is required for PostgreSQL modes")
+
+    def connect():
+        pool=_connection_pool(database_url);_OPEN_POOLS.add(pool);connection=_PooledConnection(pool,pool.getconn())
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT set_config('app.organization_id',%s,true)",(str(organization_id),))
+                cursor.execute("SELECT set_config('app.company_id',%s,true)",(str(company_id),))
+                cursor.execute("SELECT set_config('app.user_id',%s,true)",(str(user_id or ""),))
+            return connection
+        except Exception:
+            connection.close();raise
     return connect
 
 

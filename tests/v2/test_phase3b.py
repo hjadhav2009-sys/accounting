@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -18,6 +19,7 @@ from v2.backend.app.document_intelligence.pipeline import DocumentIntakeService
 from v2.backend.app.document_intelligence.repository import DocumentRepository
 from v2.backend.app.document_intelligence.models import SourceReference
 from v2.backend.app.services.storage import LocalFilesystemStorage
+from tests.v2.rls_support import set_tenant, tenant_factory
 
 
 OCR_TEXT = """Tax Invoice
@@ -127,10 +129,11 @@ class Phase3BRuntimeIntegrationTests(unittest.TestCase):
         connection = self.psycopg.connect(self.url)
         with connection.cursor() as cursor:
             cursor.execute("INSERT INTO organizations(id,name) VALUES(%s,%s)", (self.organization_id, f"Phase3B {self.organization_id}"))
+            set_tenant(cursor,self.organization_id,self.company_id)
             cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'Synthetic 3B','Synthetic 3B')", (self.company_id, self.organization_id))
             cursor.execute("INSERT INTO users(id,organization_id,email,display_name,status) VALUES(%s,%s,%s,'Phase3B','ACTIVE')", (self.user_id, self.organization_id, f"{self.user_id}@example.invalid"))
         connection.commit(); connection.close(); self.temp = tempfile.TemporaryDirectory()
-        self.repo = DocumentRepository(lambda: self.psycopg.connect(self.url)); self.context = IntakeContext(self.organization_id, self.company_id, self.user_id)
+        self.repo = DocumentRepository(tenant_factory(self.url,self.organization_id,self.company_id,self.user_id)); self.context = IntakeContext(self.organization_id, self.company_id, self.user_id)
 
     def tearDown(self): self.temp.cleanup()
 
@@ -219,7 +222,7 @@ class Phase3BRuntimeIntegrationTests(unittest.TestCase):
         batch_id = self.repo.create_batch(self.organization_id, self.company_id, self.user_id, 2)
         self.repo.start_batch(self.organization_id, self.company_id, batch_id); self.repo.batch_document_started(self.organization_id, self.company_id, batch_id)
         self.repo.batch_document_finished(self.organization_id, self.company_id, batch_id, "VERIFIED")
-        recreated = DocumentRepository(lambda: self.psycopg.connect(self.url)); status = recreated.get_batch(self.organization_id, self.company_id, batch_id)
+        recreated = DocumentRepository(tenant_factory(self.url,self.organization_id,self.company_id,self.user_id)); status = recreated.get_batch(self.organization_id, self.company_id, batch_id)
         self.assertEqual((status["processed"], status["verified"], status["queued"]), (1, 1, 1))
         self.assertIsNone(recreated.get_batch(uuid4(), self.company_id, batch_id))
         recreated.batch_document_started(self.organization_id, self.company_id, batch_id); recreated.batch_document_finished(self.organization_id, self.company_id, batch_id, "FAILED")
@@ -253,6 +256,9 @@ class Phase3BRuntimeIntegrationTests(unittest.TestCase):
                     ])
                     self.assertEqual(response.status_code, 202); batch_id = response.json()["batch_id"]
                     status = client.get(f"/api/v2/batches/{batch_id}", headers=headers).json()
+                    deadline=time.monotonic()+15
+                    while status["status"] in {"QUEUED","RUNNING"} and time.monotonic()<deadline:
+                        time.sleep(.1);status=client.get(f"/api/v2/batches/{batch_id}",headers=headers).json()
                     self.assertEqual(status["status"], "COMPLETED_WITH_ERRORS")
                     self.assertEqual((status["processed"], status["verified"], status["failed"]), (2, 1, 1))
                     documents = client.get(f"/api/v2/batches/{batch_id}/documents", headers=headers).json()["items"]

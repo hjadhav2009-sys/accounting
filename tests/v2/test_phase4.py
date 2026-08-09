@@ -18,6 +18,7 @@ from v2.backend.app.template_studio.models import CommandHistory, StudioContext,
 from v2.backend.app.template_studio.repository import TemplateRepository
 from v2.backend.app.template_studio.schema import empty_definition, sanitized_export, validate_definition
 from v2.backend.app.template_studio.service import TemplateStudioService
+from tests.v2.rls_support import set_tenant, tenant_factory
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -189,10 +190,11 @@ class Phase4PostgresIntegrationTests(unittest.TestCase):
         connection=self.psycopg.connect(self.url)
         with connection.cursor() as cursor:
             cursor.execute("INSERT INTO organizations(id,name) VALUES(%s,%s)",(self.org,f"Phase4 {self.org}"))
+            set_tenant(cursor,self.org,self.company)
             cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'Phase4','Phase4'),(%s,%s,'Other','Other')",(self.company,self.org,self.other_company,self.org))
             cursor.execute("INSERT INTO users(id,organization_id,email,display_name,status) VALUES(%s,%s,%s,'Phase4','ACTIVE')",(self.user,self.org,f"{self.user}@example.invalid"))
         connection.commit();connection.close()
-        self.repository=TemplateRepository(lambda:self.psycopg.connect(self.url));self.service=TemplateStudioService(self.repository)
+        self.repository=TemplateRepository(tenant_factory(self.url,self.org,self.company,self.user));self.service=TemplateStudioService(self.repository)
         self.context=StudioContext(self.org,self.company,self.user,frozenset({"ADMIN"}))
 
     def test_family_version_draft_save_optimistic_lock_clone_and_tenant_isolation(self):
@@ -206,7 +208,7 @@ class Phase4PostgresIntegrationTests(unittest.TestCase):
 
     def test_approval_evidence_immutability_deprecation_and_history(self):
         created=self.service.create_family(self.context,f"Approval {uuid4()}","Generic",mode="GENERIC"); version=created["version"]
-        document_id=uuid4(); DocumentRepository(lambda:self.psycopg.connect(self.url)).create(DocumentRecord(
+        document_id=uuid4(); DocumentRepository(tenant_factory(self.url,self.org,self.company,self.user)).create(DocumentRecord(
             document_id,self.org,self.company,"synthetic.pdf","synthetic.pdf","application/pdf",1,"a"*64,
             f"synthetic/{document_id}",1,DocumentStatus.UPLOADED,self.user,datetime.now(timezone.utc)))
         run_id=self.repository.create_test_run(self.org,self.company,version["id"],self.user,1);self.repository.start_test_run(self.org,self.company,run_id)

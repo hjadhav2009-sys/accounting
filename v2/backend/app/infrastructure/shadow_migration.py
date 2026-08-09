@@ -71,13 +71,14 @@ class ShadowImporter:
         report = {table: CategoryResult(source_rows=len(rows[table]), target_candidates=len(rows[table])) for table in TABLES}
         with self.connection.cursor() as cursor:
             cursor.execute(
-                "INSERT INTO organizations(id,name) VALUES(%s,%s) ON CONFLICT(id) DO UPDATE SET name=excluded.name",
+                "INSERT INTO organizations(id,name) VALUES(%s,%s) ON CONFLICT(id) DO NOTHING",
                 (self.organization_id, self.organization_name),
             )
             company_ids: dict[str, UUID] = {}
             for row in rows["companies"]:
                 identity = source_identity("companies", row)
                 entity_id = stable_legacy_uuid("companies", identity, self.organization_id)
+                self._tenant(cursor,entity_id)
                 company_ids[row["name"]] = entity_id
                 existed = self._was_imported(cursor, "companies", identity)
                 cursor.execute(
@@ -113,6 +114,7 @@ class ShadowImporter:
                         report[table].invalid_rows += 1
                         continue
                     identity = source_identity(table, row)
+                    self._tenant(cursor,company_id)
                     entity_id = stable_legacy_uuid(table, identity, self.organization_id)
                     existed = self._was_imported(cursor, table, identity)
                     cursor.execute(sql, (entity_id, self.organization_id, company_id, *values(row)))
@@ -126,6 +128,10 @@ class ShadowImporter:
             raise RuntimeError("authoritative SQLite hash changed during shadow import")
         return {"mode": "shadow-import", "sqlite_mode": "read-only-immutable", "sha256_before": before,
                 "sha256_after": after, "tables": {name: vars(result) for name, result in report.items()}}
+
+    def _tenant(self,cursor,company_id:UUID) -> None:
+        cursor.execute("SELECT set_config('app.organization_id',%s,true)",(str(self.organization_id),))
+        cursor.execute("SELECT set_config('app.company_id',%s,true)",(str(company_id),))
 
     def _record_identity(self, cursor, table: str, legacy_id: str, entity_id: UUID, company_id: UUID | None, row: dict[str, Any]) -> None:
         cursor.execute(

@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from decimal import Decimal
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
@@ -44,6 +45,29 @@ class Settings:
     ocr_max_concurrency: int = 1
     ocr_timeout_seconds: int = 120
     ocr_max_pages: int = 50
+    production_auth_enabled: bool = False
+    session_cookie_name: str = "ba_session"
+    session_cookie_secure: bool = False
+    session_idle_minutes: int = 30
+    session_absolute_hours: int = 12
+    durable_worker_enabled: bool = True
+    durable_worker_poll_seconds: float = 0.5
+    durable_stale_seconds: int = 120
+    frontend_port: int = 3000
+    backend_port: int = 8000
+    local_ai_port: int = 8080
+    postgres_port: int = 5432
+    legacy_port: int = 8501
+    bank_reconciliation_tolerance: Decimal = Decimal("0.01")
+    postgres_pool_min_size: int = 1
+    postgres_pool_max_size: int = 10
+    postgres_pool_timeout_seconds: int = 10
+    log_max_bytes: int = 5*1024*1024
+    log_backup_count: int = 5
+    temp_retention_days: int = 7
+    source_retention_days: int = 0
+    export_retention_days: int = 90
+    ai_temp_retention_hours: int = 24
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -90,6 +114,29 @@ class Settings:
             ocr_max_concurrency=max(1, min(4, int(os.getenv("OCR_MAX_CONCURRENCY", "1")))),
             ocr_timeout_seconds=max(10, min(600, int(os.getenv("OCR_TIMEOUT_SECONDS", "120")))),
             ocr_max_pages=max(1, min(200, int(os.getenv("OCR_MAX_PAGES", "50")))),
+            production_auth_enabled=os.getenv("PRODUCTION_AUTH_ENABLED", "").strip().lower() in {"1", "true", "yes"},
+            session_cookie_name=os.getenv("SESSION_COOKIE_NAME", "ba_session").strip() or "ba_session",
+            session_cookie_secure=os.getenv("SESSION_COOKIE_SECURE", "").strip().lower() in {"1", "true", "yes"},
+            session_idle_minutes=max(5, min(240, int(os.getenv("SESSION_IDLE_MINUTES", "30")))),
+            session_absolute_hours=max(1, min(168, int(os.getenv("SESSION_ABSOLUTE_HOURS", "12")))),
+            durable_worker_enabled=os.getenv("DURABLE_WORKER_ENABLED", "true").strip().lower() in {"1", "true", "yes"},
+            durable_worker_poll_seconds=max(0.1,min(10.0,float(os.getenv("DURABLE_WORKER_POLL_SECONDS","0.5")))),
+            durable_stale_seconds=max(1,min(3600,int(os.getenv("DURABLE_STALE_SECONDS","120")))),
+            frontend_port=int(os.getenv("FRONTEND_PORT","3000")),
+            backend_port=int(os.getenv("BACKEND_PORT","8000")),
+            local_ai_port=int(os.getenv("LOCAL_AI_PORT","8080")),
+            postgres_port=int(os.getenv("POSTGRES_PORT","5432") or "5432"),
+            legacy_port=int(os.getenv("LEGACY_PORT","8501")),
+            bank_reconciliation_tolerance=Decimal(os.getenv("BANK_RECONCILIATION_TOLERANCE","0.01")),
+            postgres_pool_min_size=max(0,int(os.getenv("POSTGRES_POOL_MIN_SIZE","1"))),
+            postgres_pool_max_size=max(1,int(os.getenv("POSTGRES_POOL_MAX_SIZE","10"))),
+            postgres_pool_timeout_seconds=max(1,int(os.getenv("POSTGRES_POOL_TIMEOUT_SECONDS","10"))),
+            log_max_bytes=max(1024*1024,int(os.getenv("LOG_MAX_BYTES",str(5*1024*1024)))),
+            log_backup_count=max(1,min(20,int(os.getenv("LOG_BACKUP_COUNT","5")))),
+            temp_retention_days=max(1,int(os.getenv("TEMP_RETENTION_DAYS","7"))),
+            source_retention_days=max(0,int(os.getenv("SOURCE_RETENTION_DAYS","0"))),
+            export_retention_days=max(1,int(os.getenv("EXPORT_RETENTION_DAYS","90"))),
+            ai_temp_retention_hours=max(1,int(os.getenv("AI_TEMP_RETENTION_HOURS","24"))),
         )
 
     def public_info(self) -> dict[str, str]:
@@ -101,7 +148,9 @@ class Settings:
             "storage_mode": self.storage_mode,
             "legacy_authority": "enabled",
             "postgres_cutover": "disabled",
-            "ai_inference": "configured" if (self.local_ai_model or self.cloudflare_ai_worker_url) else "disabled",
+            # Public system information never discloses configured inference
+            # providers. Authorized administrators use the health endpoint.
+            "ai_inference": "disabled",
             "ai_mode": self.ai_mode,
             "ai_billing_mode": self.ai_billing_mode,
             "sqlite_authoritative": "true",

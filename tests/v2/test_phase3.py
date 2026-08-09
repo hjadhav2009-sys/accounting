@@ -19,6 +19,7 @@ from v2.backend.app.document_intelligence.security import DocumentSecurityError,
 from v2.backend.app.document_intelligence.status_machine import DocumentStatusMachine, InvalidDocumentTransition
 from v2.backend.app.document_intelligence.validation import AccountingValidationEngine, InvoiceTotalValidator, QuantityValidator, TaxBucketValidator
 from v2.backend.app.services.storage import LocalFilesystemStorage
+from tests.v2.rls_support import set_tenant, tenant_factory
 
 
 SUJAL_TEXT = """Tax Invoice
@@ -176,13 +177,14 @@ class Phase3PostgreSQLRuntimeTests(unittest.TestCase):
         connection = psycopg.connect(self.url)
         with connection.cursor() as cursor:
             cursor.execute("INSERT INTO organizations(id,name) VALUES(%s,%s)", (self.organization_id, f"Phase3 {self.organization_id}"))
+            set_tenant(cursor,self.organization_id,self.company_id)
             cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'Synthetic Phase3','Synthetic Phase3')", (self.company_id, self.organization_id))
             cursor.execute("INSERT INTO users(id,organization_id,email,display_name,status) VALUES(%s,%s,%s,'Phase3','ACTIVE')",
                            (self.user_id, self.organization_id, f"{self.user_id}@example.invalid"))
         connection.commit()
         connection.close()
         self.temporary = tempfile.TemporaryDirectory()
-        self.repository = DocumentRepository(lambda: psycopg.connect(self.url))
+        self.repository = DocumentRepository(tenant_factory(self.url,self.organization_id,self.company_id,self.user_id))
         self.service = DocumentIntakeService(self.repository, LocalFilesystemStorage(self.temporary.name))
         self.context = IntakeContext(self.organization_id, self.company_id, self.user_id)
 

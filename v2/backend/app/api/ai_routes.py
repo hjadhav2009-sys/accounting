@@ -15,7 +15,7 @@ from ..hybrid_ai.providers import CloudAiService, LocalAiService
 from ..hybrid_ai.quota import AiQuotaService, PostgresAiQuotaService
 from ..hybrid_ai.repository import AiRepository
 from ..hybrid_ai.service import HybridAiService
-from ..infrastructure.postgres import psycopg_connection_factory
+from ..infrastructure.postgres import psycopg_connection_factory, psycopg_tenant_connection_factory
 from .document_routes import RequestContext, request_context
 
 
@@ -53,15 +53,17 @@ def build_service(context: RequestContext | None = None) -> HybridAiService:
     quota: Any=AiQuotaService(limit=settings.ai_daily_free_neurons,billing_mode=BillingMode(settings.ai_billing_mode))
     url=settings.postgres_url or settings.database_url
     if context and cloud and url:
-        quota=PostgresAiQuotaService(psycopg_connection_factory(url),context.organization_id,context.company_id,
+        quota=PostgresAiQuotaService(psycopg_tenant_connection_factory(
+            url,context.organization_id,context.company_id,context.user_id),context.organization_id,context.company_id,
                                      settings.cloudflare_account_id or "byoc-default",settings.ai_daily_free_neurons,
                                      billing_mode=BillingMode(settings.ai_billing_mode))
     return HybridAiService(local=local,cloud=cloud,privacy=PrivacyService(),policy=AiPolicyService(),quota=quota)
 
 
-def repository() -> AiRepository | None:
+def repository(context: RequestContext) -> AiRepository | None:
     settings=get_settings(); url=settings.postgres_url or settings.database_url
-    return AiRepository(psycopg_connection_factory(url)) if url else None
+    return AiRepository(psycopg_tenant_connection_factory(
+        url,context.organization_id,context.company_id,context.user_id)) if url else None
 
 
 @router.get("/status")
@@ -106,7 +108,7 @@ def payload_preview(payload: PayloadPreviewRequest,
 
 @router.post("/proposals")
 def propose(payload: ProposalRequest, context: Annotated[RequestContext, Depends(request_context)]):
-    service=build_service(context); repo=repository(); job=None
+    service=build_service(context); repo=repository(context); job=None
     if repo:
         job=repo.create_job(context.organization_id,context.company_id,context.user_id,payload.intent,
                             payload.mode.value,payload.privacy_mode.value,service.prompt_version)
@@ -120,7 +122,7 @@ def propose(payload: ProposalRequest, context: Annotated[RequestContext, Depends
 
 @router.post("/jobs/{job_id}/cancel")
 def cancel(job_id: UUID, context: Annotated[RequestContext, Depends(request_context)]):
-    repo=repository()
+    repo=repository(context)
     if not repo: raise HTTPException(503,"PostgreSQL V2 metadata connection is not configured")
     if not repo.cancel_job(context.organization_id,context.company_id,job_id):
         raise HTTPException(409,"job is not cancellable")
@@ -129,7 +131,7 @@ def cancel(job_id: UUID, context: Annotated[RequestContext, Depends(request_cont
 
 @router.get("/dashboard")
 def dashboard(context: Annotated[RequestContext, Depends(request_context)]):
-    repo=repository()
+    repo=repository(context)
     if not repo: return {"jobs":{},"usage_30d":{"input_tokens":0,"output_tokens":0,"units":0},
                          "raw_payload_retention":False,"reset_timezone":"UTC"}
     return repo.dashboard(context.organization_id,context.company_id)

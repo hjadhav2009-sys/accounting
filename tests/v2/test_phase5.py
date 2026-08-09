@@ -27,6 +27,7 @@ from v2.backend.app.hybrid_ai.service import HybridAiService
 from v2.backend.app.hybrid_ai.template_actions import TemplateActionAdapter
 from v2.backend.app.template_studio.models import StudioContext
 from v2.backend.app.infrastructure.postgres_migrations import apply_migrations
+from tests.v2.rls_support import set_tenant, tenant_factory
 
 
 ROOT=Path(__file__).resolve().parents[2]
@@ -314,10 +315,11 @@ class Phase5PostgresTests(unittest.TestCase):
         connection=psycopg.connect(url)
         with connection.cursor() as cursor:
             cursor.execute("INSERT INTO organizations(id,name) VALUES(%s,%s)",(org,f"AI quota {org}"))
+            set_tenant(cursor,org,company)
             cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'AI quota','AI quota')",(company,org))
             cursor.execute("INSERT INTO users(id,organization_id,email,display_name,status) VALUES(%s,%s,%s,'AI quota','ACTIVE')",(user,org,f"{user}@example.invalid"))
         connection.commit();connection.close()
-        service=PostgresAiQuotaService(lambda:psycopg.connect(url),org,company,"synthetic-byoc",1000)
+        service=PostgresAiQuotaService(tenant_factory(url,org,company,user),org,company,"synthetic-byoc",1000)
         reserved=service.reserve(200);self.assertEqual(reserved.reserved,200)
         reconciled=service.reconcile(reserved.reservation_id,120);self.assertEqual((reconciled.used,reconciled.reserved),(120,0))
 
@@ -330,17 +332,19 @@ class Phase5PostgresTests(unittest.TestCase):
         connection=psycopg.connect(url)
         with connection.cursor() as cursor:
             cursor.execute("INSERT INTO organizations(id,name) VALUES(%s,%s)",(org,f"AI memory {org}"))
+            set_tenant(cursor,org,company)
             cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'AI memory','AI memory')",(company,org))
             cursor.execute("INSERT INTO users(id,organization_id,email,display_name,status) VALUES(%s,%s,%s,'AI memory','ACTIVE')",(user,org,f"{user}@example.invalid"))
         connection.commit();connection.close()
-        studio=TemplateStudioService(TemplateRepository(lambda:psycopg.connect(url)))
+        studio=TemplateStudioService(TemplateRepository(tenant_factory(url,org,company,user)))
         context=StudioContext(org,company,user,frozenset({"ADMIN"}))
         version=studio.create_family(context,"Approved correction family","INVOICE",mode="GENERIC")["version"]
         connection=psycopg.connect(url)
         with connection.cursor() as cursor:
+            set_tenant(cursor,org,company)
             cursor.execute("UPDATE template_versions SET status='APPROVED',approved_by=%s,approved_at=now() WHERE id=%s",(user,version["id"]))
         connection.commit();connection.close()
-        repository=AiRepository(lambda:psycopg.connect(url))
+        repository=AiRepository(tenant_factory(url,org,company,user))
         repository.store_approved_correction(org,company,version["id"],user,"family-a","INVOICE",{"field":"quantity","was":"amount"})
         own=repository.retrieve_approved_corrections(org,company,"family-a","INVOICE")
         foreign=repository.retrieve_approved_corrections(uuid4(),uuid4(),"family-a","INVOICE")
@@ -353,13 +357,14 @@ class Phase5PostgresTests(unittest.TestCase):
         connection=psycopg.connect(url);apply_migrations(connection)
         with connection.cursor() as cursor:
             cursor.execute("INSERT INTO organizations(id,name) VALUES(%s,%s)",(org,f"AI reset {org}"))
+            set_tenant(cursor,org,company)
             cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'AI reset','AI reset')",(company,org))
             cursor.execute("INSERT INTO users(id,organization_id,email,display_name,status) VALUES(%s,%s,%s,'AI reset','ACTIVE')",(user,org,f"{user}@example.invalid"))
             cursor.execute("INSERT INTO document_format_families(id,organization_id,company_id,name,document_type,created_by) VALUES(%s,%s,%s,%s,'GENERIC',%s)",(family,org,company,f"reset-{family}",user))
             cursor.execute("INSERT INTO template_versions(id,family_id,version,status,definition,created_by) VALUES(%s,%s,1,'DRAFT','{}'::jsonb,%s)",(version,family,user))
             cursor.execute("INSERT INTO documents(id,organization_id,company_id,filename,mime_type,byte_size,storage_key,status,created_by) VALUES(%s,%s,%s,'synthetic.pdf','application/pdf',1,'synthetic','UPLOADED',%s)",(document,org,company,user))
         connection.commit();connection.close()
-        repository=AiRepository(lambda:psycopg.connect(url))
+        repository=AiRepository(tenant_factory(url,org,company,user))
         job=repository.create_job(org,company,user,"draft_template","HYBRID_PRIVATE","BALANCED","v1")
         self.assertTrue(repository.queue_until_reset(org,company,job["id"],document,version,1,now))
         claimed=[]

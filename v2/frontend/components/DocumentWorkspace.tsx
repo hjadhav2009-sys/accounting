@@ -16,16 +16,19 @@ export function DocumentWorkspace() {
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
   const [batchId, setBatchId] = useState("");
+  const [financialYearId,setFinancialYearId]=useState("");
   const [filters, setFilters] = useState({ search: "", status: "", document_type: "", supplier: "", date_from: "", date_to: "", validation_status: "", review_status: "", duplicate_status: "", format_family_id: "", uploaded_by: "" });
   useEffect(() => {
     const query = new URLSearchParams(window.location.search);
     setFilters((current) => Object.fromEntries(Object.keys(current).map((key) => [key, query.get(key) || ""])) as typeof current);
+    setFinancialYearId(window.sessionStorage.getItem("ba_financial_year")||"");
   }, []);
   const queryString = useMemo(() => {
     const query = new URLSearchParams();
     Object.entries(filters).forEach(([key, value]) => { if (value && (!key.endsWith("_id") || /^[0-9a-f-]{36}$/i.test(value))) query.set(key, value); });
+    if(financialYearId)query.set("financial_year_id",financialYearId);
     return query.toString();
-  }, [filters]);
+  }, [filters,financialYearId]);
   const load = useCallback(async () => {
     if (!context) return;
     setLoading(true);

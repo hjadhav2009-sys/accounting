@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date,datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable
 from uuid import UUID, uuid4
@@ -74,18 +74,30 @@ class DocumentRepository:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError(f"document transition conflict: {expected.value} -> {target.value}")
+            invoice_date=updates.get("invoice_date")
+            if invoice_date:
+                if isinstance(invoice_date,str):invoice_date=date.fromisoformat(invoice_date)
+                start_year=invoice_date.year if invoice_date.month>=4 else invoice_date.year-1
+                starts=date(start_year,4,1);ends=date(start_year+1,3,31);label=f"{start_year}-{str(start_year+1)[-2:]}";financial_year_id=uuid4()
+                cursor.execute("""INSERT INTO financial_years(id,organization_id,company_id,label,starts_on,ends_on)
+                    VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(company_id,label) DO UPDATE SET label=excluded.label RETURNING id""",
+                    (financial_year_id,organization_id,company_id,label,starts,ends));financial_year_id=cursor.fetchone()[0]
+                cursor.execute("UPDATE documents SET financial_year_id=%s WHERE id=%s AND organization_id=%s AND company_id=%s",
+                    (financial_year_id,document_id,organization_id,company_id))
 
     def list(self, organization_id: UUID, company_id: UUID, status: str | None = None,
              search: str = "", limit: int = 100, offset: int = 0, *,
              date_from: str | None = None, date_to: str | None = None,
              document_type: str = "", supplier: str = "", format_family_id: UUID | None = None,
              validation_status: str = "", review_status: str = "", duplicate_status: str = "",
-             uploaded_by: UUID | None = None) -> list[dict[str, Any]]:
+             uploaded_by: UUID | None = None, financial_year_id:UUID|None=None) -> list[dict[str, Any]]:
         clauses = ["d.organization_id=%s", "d.company_id=%s"]
         parameters: list[Any] = [organization_id, company_id]
         if status:
             clauses.append("d.status=%s")
             parameters.append(status)
+        if financial_year_id:
+            clauses.append("d.financial_year_id=%s");parameters.append(financial_year_id)
         if search:
             clauses.append("(d.original_filename ILIKE %s OR d.supplier ILIKE %s OR d.invoice_number ILIKE %s)")
             parameters.extend([f"%{search}%"] * 3)
@@ -285,6 +297,31 @@ class DocumentRepository:
             cursor.execute("SELECT code,severity,message,source_reference FROM validation_issues WHERE validation_result_id=%s ORDER BY severity,code", (result["id"],))
             result["issues"] = self._records(cursor)
             return result
+
+    def record_export(self, organization_id:UUID,company_id:UUID,document_id:UUID,actor_id:UUID,
+                      export_type:str,filename:str,file_sha256:str,validation_status:str,
+                      extraction_result_id:UUID|None,evidence:dict[str,Any])->UUID:
+        export_id=uuid4()
+        with self._cursor() as cursor:
+            cursor.execute("""INSERT INTO document_exports(id,organization_id,company_id,document_id,export_type,
+                filename,file_sha256,validation_status,extraction_result_id,evidence,created_by)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s)""",
+                (export_id,organization_id,company_id,document_id,export_type,filename,file_sha256,
+                 validation_status,extraction_result_id,json.dumps(to_jsonable(evidence)),actor_id))
+            cursor.execute("""INSERT INTO audit_logs(id,organization_id,company_id,actor_id,action,entity_type,
+                entity_id,new_reference,document_id,reason,source_context)
+                VALUES(%s,%s,%s,%s,%s,'document_export',%s,%s,%s,'deterministic verified export',%s::jsonb)""",
+                (uuid4(),organization_id,company_id,actor_id,f"{export_type}_EXPORTED",str(export_id),file_sha256,
+                 document_id,json.dumps({"filename":filename,"validation_status":validation_status})))
+        return export_id
+
+    def exports(self,organization_id:UUID,company_id:UUID,document_id:UUID|None=None)->list[dict[str,Any]]:
+        with self._cursor() as cursor:
+            cursor.execute("""SELECT id,document_id,export_type,filename,file_sha256,validation_status,evidence,
+                created_by,created_at FROM document_exports WHERE organization_id=%s AND company_id=%s
+                AND (%s IS NULL OR document_id=%s) ORDER BY created_at DESC""",
+                (organization_id,company_id,document_id,document_id))
+            return self._records(cursor)
 
     def create_review(self, record: DocumentRecord, reason: str, severity: str = "REVIEW", detail: dict[str, Any] | None = None) -> UUID:
         review_id = uuid4()
@@ -506,6 +543,19 @@ class DocumentRepository:
             cursor.execute("""SELECT count(*) FROM review_tasks WHERE organization_id=%s AND company_id=%s
                 AND reason_code='BANK_RECONCILIATION_FAILED' AND status='OPEN'""", (organization_id, company_id))
             bank_failures = cursor.fetchone()[0]
+            cursor.execute("""SELECT u.id,u.display_name,u.email,count(DISTINCT d.id) documents,
+                count(DISTINCT r.id) FILTER(WHERE r.resolved_by=u.id) reviews
+                FROM users u LEFT JOIN documents d ON d.created_by=u.id AND d.company_id=%s
+                LEFT JOIN review_tasks r ON r.resolved_by=u.id AND r.company_id=%s
+                WHERE u.organization_id=%s GROUP BY u.id ORDER BY documents DESC,reviews DESC,u.display_name""",
+                (company_id,company_id,organization_id));user_activity=self._records(cursor)
+            cursor.execute("""SELECT count(*) FILTER(WHERE provider='LOCAL'),
+                count(*) FILTER(WHERE provider='CLOUDFLARE_WORKERS_AI'),count(*)
+                FROM ai_audit_events WHERE organization_id=%s AND company_id=%s""",(organization_id,company_id));local_ai,cloud_ai,ai_events=cursor.fetchone()
+            cursor.execute("""SELECT coalesce(sum(used_units),0),coalesce(sum(reserved_units),0) FROM ai_daily_usage
+                WHERE organization_id=%s AND company_id=%s""",(organization_id,company_id));used_units,reserved_units=cursor.fetchone()
+            cursor.execute("""SELECT export_type,count(*),max(created_at) FROM document_exports
+                WHERE organization_id=%s AND company_id=%s GROUP BY export_type ORDER BY export_type""",(organization_id,company_id));export_rows=cursor.fetchall()
         processed = sum(document_statuses.values())
         verified = document_statuses.get("VERIFIED", 0)
         review = document_statuses.get("REVIEW", 0)
@@ -520,7 +570,21 @@ class DocumentRepository:
             "processing": {"success_rate": Decimal(verified) * 100 / Decimal(processed) if processed else Decimal("0"),
                 "review_rate": Decimal(review) * 100 / Decimal(processed) if processed else Decimal("0"),
                 "OCR_usage": ocr_metrics, "average_duration_ms": average_duration, "metric_count": metric_count},
+            "users":{"activity":user_activity},
+            "ai":{"local_jobs":local_ai,"cloud_jobs":cloud_ai,"audit_events":ai_events,"used_units":used_units,
+                "reserved_units":reserved_units,"cloud_avoided":max(0,metric_count-cloud_ai)},
+            "exports":{"types":{row[0]:{"count":row[1],"last_exported_at":row[2]} for row in export_rows}},
             "generated_at": datetime.now(timezone.utc)}
+
+    def financial_years(self,organization_id:UUID,company_id:UUID)->list[dict[str,Any]]:
+        with self._cursor() as cursor:
+            cursor.execute("SELECT id,label,starts_on,ends_on,active FROM financial_years WHERE organization_id=%s AND company_id=%s ORDER BY starts_on DESC",(organization_id,company_id))
+            return self._records(cursor)
+
+    def financial_year(self,organization_id:UUID,company_id:UUID,financial_year_id:UUID)->dict[str,Any]|None:
+        with self._cursor() as cursor:
+            cursor.execute("SELECT id,label,starts_on,ends_on,active FROM financial_years WHERE id=%s AND organization_id=%s AND company_id=%s",(financial_year_id,organization_id,company_id));records=self._records(cursor)
+            return records[0] if records else None
 
     def _count_reviews(self, organization_id: UUID, company_id: UUID, reason: str) -> int:
         with self._cursor() as cursor:

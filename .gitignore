@@ -23,6 +23,7 @@ exports/
 backups/
 audit/
 logs/
+.runtime/
 tmp/
 cache/
 v2_data/

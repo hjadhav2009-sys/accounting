@@ -15,6 +15,7 @@ from v2.backend.app.jobs import InvalidJobTransition, PersistentJobManager
 from v2.backend.app.repositories.factory import build_repositories
 from v2.backend.app.security import AuthorizationService, TenantAccessService
 from v2.backend.app.services.parity import ParityRecorder, ParityStatus, ShadowRepositories, classify
+from tests.v2.rls_support import set_tenant, tenant_factory
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -210,7 +211,8 @@ class PostgreSQLRuntimeIntegrationTests(unittest.TestCase):
             connection.close()
         self.assertTrue(all(item["inserted"] == 1 for item in first["tables"].values()))
         self.assertTrue(all(item["updated"] == 1 for item in second["tables"].values()))
-        repository = PostgresRepositories(lambda: psycopg.connect(self.url), organization_id)
+        imported_company=stable_legacy_uuid("companies","Synthetic Co",organization_id)
+        repository = PostgresRepositories(tenant_factory(self.url,organization_id,imported_company), organization_id)
         self.assertEqual(repository.party_ledger("Synthetic Co", " market\n"), "Synthetic Party")
         self.assertEqual(repository.map_ledger("Synthetic Co", "marketplace", "market", "A Collection Fee charged"), ("Ledger A", "Collection Fee"))
 
@@ -222,15 +224,18 @@ class PostgreSQLRuntimeIntegrationTests(unittest.TestCase):
         connection = psycopg.connect(self.url)
         with connection.cursor() as cursor:
             cursor.execute("INSERT INTO organizations(id,name) VALUES(%s,%s),(%s,%s)", (org_a, f"Org {org_a}", org_b, f"Org {org_b}"))
-            cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'Company','Company'),(%s,%s,'Company','Company')", (company_a, org_a, company_b, org_b))
+            set_tenant(cursor,org_a,company_a)
+            cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'Company','Company')", (company_a, org_a))
             cursor.execute("""INSERT INTO ledger_mappings(id,organization_id,company_id,tool,platform,pattern,ledger,match_type)
-                            VALUES(%s,%s,%s,'marketplace','market','Collection Fee','Ledger A','contains'),
-                                  (%s,%s,%s,'marketplace','market','Collection Fee','Ledger B','contains')""",
-                           (uuid4(), org_a, company_a, uuid4(), org_b, company_b))
+                            VALUES(%s,%s,%s,'marketplace','market','Collection Fee','Ledger A','contains')""",(uuid4(), org_a, company_a))
+            set_tenant(cursor,org_b,company_b)
+            cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'Company','Company')", (company_b, org_b))
+            cursor.execute("""INSERT INTO ledger_mappings(id,organization_id,company_id,tool,platform,pattern,ledger,match_type)
+                            VALUES(%s,%s,%s,'marketplace','market','Collection Fee','Ledger B','contains')""",(uuid4(), org_b, company_b))
         connection.commit()
         connection.close()
-        repo_a = PostgresRepositories(lambda: psycopg.connect(self.url), org_a)
-        repo_b = PostgresRepositories(lambda: psycopg.connect(self.url), org_b)
+        repo_a = PostgresRepositories(tenant_factory(self.url,org_a,company_a), org_a)
+        repo_b = PostgresRepositories(tenant_factory(self.url,org_b,company_b), org_b)
         self.assertEqual(repo_a.map_ledger("Company", "marketplace", "market", "Collection Fee")[0], "Ledger A")
         self.assertEqual(repo_b.map_ledger("Company", "marketplace", "market", "Collection Fee")[0], "Ledger B")
 
@@ -243,6 +248,7 @@ class PostgreSQLRuntimeIntegrationTests(unittest.TestCase):
         connection = psycopg.connect(self.url)
         with connection.cursor() as cursor:
             cursor.execute("INSERT INTO organizations(id,name) VALUES(%s,%s)", (org, f"Org {org}"))
+            set_tenant(cursor,org,company)
             cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'Synthetic','Synthetic')", (company, org))
             cursor.execute("INSERT INTO users(id,organization_id,email,display_name,status) VALUES(%s,%s,%s,'Synthetic','ACTIVE')", (user, org, f"{user}@example.invalid"))
             cursor.execute("INSERT INTO invoices(id,organization_id,company_id,invoice_number,supplier,document_type,total) VALUES(%s,%s,%s,'INV-X','Synthetic','Tax Invoice',27271.82)", (invoice, org, company))
@@ -251,14 +257,14 @@ class PostgreSQLRuntimeIntegrationTests(unittest.TestCase):
                            (uuid4(), invoice, uuid4(), invoice))
         connection.commit()
         connection.close()
-        repo = PostgresRepositories(lambda: psycopg.connect(self.url), org)
+        repo = PostgresRepositories(tenant_factory(self.url,org,company,user), org)
         identity = DocumentIdentity(document, org, company, "a" * 64, "synthetic.pdf", "application/pdf", 9, datetime.now(timezone.utc), user)
         self.assertTrue(repo.save_document(identity, f"{org}/{company}/{document}"))
         self.assertFalse(repo.save_document(identity, f"{org}/{company}/{document}"))
         job = Job("synthetic", org, company, user)
         repo.save(job)
         repo.append(AuditEvent("MIGRATION_SHADOW_IMPORTED", org, company, user, "job", job.job_id))
-        summary = PostgresReportingService(lambda: psycopg.connect(self.url), org).invoice_summary(company)
+        summary = PostgresReportingService(tenant_factory(self.url,org,company,user), org).invoice_summary(company)
         self.assertEqual(summary["igst"], Decimal("1427.82"))
 
     def test_numeric_precision_and_tenant_scoped_duplicates(self):
@@ -277,14 +283,17 @@ class PostgreSQLRuntimeIntegrationTests(unittest.TestCase):
         connection = psycopg.connect(self.url)
         with connection.cursor() as cursor:
             cursor.execute("INSERT INTO organizations(id,name) VALUES(%s,%s),(%s,%s)", (org_a, f"Org {org_a}", org_b, f"Org {org_b}"))
-            cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'A','A'),(%s,%s,'B','B')", (company_a, org_a, company_b, org_b))
+            set_tenant(cursor,org_a,company_a)
+            cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'A','A')", (company_a, org_a))
+            set_tenant(cursor,org_b,company_b)
+            cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'B','B')", (company_b, org_b))
             cursor.execute("INSERT INTO users(id,organization_id,email,display_name,status) VALUES(%s,%s,%s,'A','ACTIVE'),(%s,%s,%s,'B','ACTIVE')",
                            (user_a, org_a, f"{user_a}@example.invalid", user_b, org_b, f"{user_b}@example.invalid"))
         connection.commit()
         connection.close()
         digest = "b" * 64
-        repo_a = PostgresRepositories(lambda: psycopg.connect(self.url), org_a)
-        repo_b = PostgresRepositories(lambda: psycopg.connect(self.url), org_b)
+        repo_a = PostgresRepositories(tenant_factory(self.url,org_a,company_a,user_a), org_a)
+        repo_b = PostgresRepositories(tenant_factory(self.url,org_b,company_b,user_b), org_b)
         doc_a = DocumentIdentity(uuid4(), org_a, company_a, digest, "a.pdf", "application/pdf", 1, datetime.now(timezone.utc), user_a)
         doc_b = DocumentIdentity(uuid4(), org_b, company_b, digest, "b.pdf", "application/pdf", 1, datetime.now(timezone.utc), user_b)
         self.assertTrue(repo_a.save_document(doc_a, f"{org_a}/{doc_a.document_id}"))
@@ -299,13 +308,14 @@ class PostgreSQLRuntimeIntegrationTests(unittest.TestCase):
         connection = psycopg.connect(self.url)
         with connection.cursor() as cursor:
             cursor.execute("INSERT INTO organizations(id,name) VALUES(%s,%s)", (org, f"Org {org}"))
+            set_tenant(cursor,org,company)
             cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'Jobs','Jobs')", (company, org))
             cursor.execute("INSERT INTO users(id,organization_id,email,display_name,status) VALUES(%s,%s,%s,'Jobs','ACTIVE')", (user, org, f"{user}@example.invalid"))
         connection.commit()
         connection.close()
 
         def manager():
-            return PersistentJobManager(PostgresJobRepository(lambda: psycopg.connect(self.url), org))
+            return PersistentJobManager(PostgresJobRepository(tenant_factory(self.url,org,company,user), org))
 
         completed = Job("completed", org, company, user)
         manager().save(completed)
@@ -324,12 +334,12 @@ class PostgreSQLRuntimeIntegrationTests(unittest.TestCase):
         with self.assertRaises(InvalidJobTransition):
             manager().transition(failed.job_id, JobStatus.RUNNING)
 
-        audit = PostgresAuditRepository(lambda: psycopg.connect(self.url), org)
+        audit = PostgresAuditRepository(tenant_factory(self.url,org,company,user), org)
         first = AuditEvent("MIGRATION_SHADOW_IMPORTED", org, company, user, "job", completed.job_id)
         second = AuditEvent("PARITY_MISMATCH_DETECTED", org, company, user, "job", review.job_id, reason="synthetic reference only")
         audit.append(first)
-        PostgresAuditRepository(lambda: psycopg.connect(self.url), org).append(second)
-        events = PostgresAuditRepository(lambda: psycopg.connect(self.url), org).list_events()
+        PostgresAuditRepository(tenant_factory(self.url,org,company,user), org).append(second)
+        events = PostgresAuditRepository(tenant_factory(self.url,org,company,user), org).list_events()
         self.assertEqual([event.event_id for event in events], [first.event_id, second.event_id])
         self.assertNotIn("postgresql://", repr(events).lower())
 
@@ -341,7 +351,8 @@ class PostgreSQLRuntimeIntegrationTests(unittest.TestCase):
         connection = psycopg.connect(self.url)
         with connection.cursor() as cursor:
             cursor.execute("INSERT INTO organizations(id,name) VALUES(%s,%s),(%s,%s)", (org_a, f"Org {org_a}", org_b, f"Org {org_b}"))
-            cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'Report A','Report A'),(%s,%s,'Report B','Report B')", (company_a, org_a, company_b, org_b))
+            set_tenant(cursor,org_a,company_a)
+            cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'Report A','Report A')", (company_a, org_a))
             cursor.execute("INSERT INTO users(id,organization_id,email,display_name,status) VALUES(%s,%s,%s,'Report','ACTIVE')", (user_a, org_a, f"{user_a}@example.invalid"))
             cursor.execute("""INSERT INTO documents(id,organization_id,company_id,filename,mime_type,byte_size,storage_key,status,created_by)
                             VALUES(%s,%s,%s,'synthetic.pdf','application/pdf',1,'synthetic','VERIFIED',%s)""", (document, org_a, company_a, user_a))
@@ -353,13 +364,17 @@ class PostgreSQLRuntimeIntegrationTests(unittest.TestCase):
                             VALUES(%s,%s,%s,%s,'synthetic-market','Synthetic','Tax Invoice','SYN-1','Purchase',625.75)""",
                            (uuid4(), org_a, company_a, document))
             cursor.execute("""INSERT INTO ledger_mappings(id,organization_id,company_id,tool,platform,pattern,ledger,match_type)
-                            VALUES(%s,%s,%s,'marketplace','market','RLS Pattern','Ledger A','contains'),
-                                  (%s,%s,%s,'marketplace','market','RLS Pattern','Ledger B','contains')""",
-                           (uuid4(), org_a, company_a, uuid4(), org_b, company_b))
+                            VALUES(%s,%s,%s,'marketplace','market','RLS Pattern','Ledger A','contains')""",
+                           (uuid4(), org_a, company_a))
+            set_tenant(cursor,org_b,company_b)
+            cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'Report B','Report B')", (company_b, org_b))
+            cursor.execute("""INSERT INTO ledger_mappings(id,organization_id,company_id,tool,platform,pattern,ledger,match_type)
+                            VALUES(%s,%s,%s,'marketplace','market','RLS Pattern','Ledger B','contains')""",
+                           (uuid4(), org_b, company_b))
         connection.commit()
         connection.close()
 
-        reporting = PostgresReportingService(lambda: psycopg.connect(self.url), org_a)
+        reporting = PostgresReportingService(tenant_factory(self.url,org_a,company_a,user_a), org_a)
         self.assertEqual(reporting.document_summary(company_a)["verified"], 1)
         self.assertEqual(reporting.bank_summary(company_a), {"credits": Decimal("500.50"), "debits": Decimal("125.25")})
         self.assertEqual(reporting.marketplace_summary(company_a)["platforms"][0]["total"], Decimal("625.75"))
@@ -370,6 +385,7 @@ class PostgreSQLRuntimeIntegrationTests(unittest.TestCase):
                 cursor.execute("ALTER TABLE ledger_mappings ENABLE ROW LEVEL SECURITY")
                 cursor.execute("ALTER TABLE ledger_mappings FORCE ROW LEVEL SECURITY")
                 cursor.execute("SELECT set_config('app.organization_id',%s,true)", (str(org_a),))
+                cursor.execute("SELECT set_config('app.company_id',%s,true)", (str(company_a),))
                 cursor.execute("SELECT count(*) FROM ledger_mappings WHERE pattern='RLS Pattern'")
                 self.assertEqual(cursor.fetchone()[0], 1)
             connection.rollback()

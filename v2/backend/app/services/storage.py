@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 from typing import Protocol
 from uuid import UUID
 
@@ -41,3 +42,18 @@ class LocalFilesystemStorage:
 
     def read(self, storage_key: str) -> bytes:
         return self._resolve_key(storage_key).read_bytes()
+
+    def put_pending(self, organization_id: UUID, company_id: UUID, job_id: UUID,
+                    filename: str, content: bytes) -> StoredDocument:
+        suffix=Path(filename).suffix.lower() or ".bin"
+        key=f"_queue/{organization_id}/{company_id}/{job_id}{suffix}"
+        target=self._resolve_key(key);target.parent.mkdir(parents=True,exist_ok=True)
+        temporary=target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+        temporary.write_bytes(content);temporary.replace(target)
+        digest=sha256_bytes(content)
+        return StoredDocument(key,digest,len(content))
+
+    def delete_pending(self,storage_key:str) -> None:
+        if not storage_key.startswith("_queue/"): raise ValueError("only queued source files can be deleted")
+        target=self._resolve_key(storage_key)
+        if target.exists(): target.unlink()
