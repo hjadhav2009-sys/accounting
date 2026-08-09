@@ -16,10 +16,13 @@ def main() -> None:
     with psycopg.connect(admin_url, autocommit=True) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                sql.SQL("CREATE ROLE {} LOGIN PASSWORD %s NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS").format(
-                    sql.Identifier(role)
-                ),
-                (os.environ["POSTGRES_CI_APP_PASSWORD"],),
+                sql.SQL(
+                    "CREATE ROLE {} LOGIN PASSWORD {} "
+                    "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS"
+                ).format(
+                    sql.Identifier(role),
+                    sql.Literal(os.environ["POSTGRES_CI_APP_PASSWORD"]),
+                )
             )
             cursor.execute(
                 sql.SQL("CREATE DATABASE {} OWNER {}").format(
