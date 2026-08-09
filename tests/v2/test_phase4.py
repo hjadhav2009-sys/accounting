@@ -34,7 +34,7 @@ def mapped_definition(mode: str = "INVOICE"):
          "transforms": ["remove_currency_symbol", "remove_grouping_comma", "parse_decimal"]},
         {"id": "items", "type": "TABLE", "table_type": "ITEM",
          "box": {"x0": .05, "y0": .2, "x1": .95, "y1": .7}, "page_policy": "TABLE_REPEAT",
-         "columns": [{"boundary": .3, "field": "item_name"}, {"boundary": .6, "field": "quantity"}, {"boundary": .9, "field": "line_total"}],
+         "columns": [{"boundary": .3, "field": "item_name","source_index":0}, {"boundary": .6, "field": "quantity","source_index":1}, {"boundary": .9, "field": "line_total","source_index":2}],
          "row_classifiers": [{"text": "Total", "row_type": "TOTAL"}], "multiline_strategy": "same-cell", "repeating": True},
     ]
     return definition
@@ -113,16 +113,29 @@ class TemplateRuleEngineTests(unittest.TestCase):
         self.assertEqual(len(result["item_rows"]),1); self.assertEqual(result["item_rows"][0]["values"]["item_name"],"Bracelet (black)")
 
     def test_multiple_tax_rows_remain_independent(self):
-        definition=empty_definition("INVOICE"); definition["objects"]=[{"id":"tax","type":"TABLE","table_type":"TAX_SUMMARY","box":{"x0":0,"y0":0,"x1":1,"y1":1},"page_policy":"TABLE_REPEAT","columns":[{"boundary":.3,"field":"tax_type"},{"boundary":.6,"field":"gst_rate"},{"boundary":.9,"field":"tax_amount"}],"row_classifiers":[],"multiline_strategy":"same-cell","repeating":True}]
+        definition=empty_definition("INVOICE"); definition["objects"]=[{"id":"tax","type":"TABLE","table_type":"TAX_SUMMARY","box":{"x0":0,"y0":0,"x1":1,"y1":1},"page_policy":"TABLE_REPEAT","columns":[{"boundary":.3,"field":"tax_type","source_index":0},{"boundary":.6,"field":"gst_rate","source_index":1},{"boundary":.9,"field":"tax_amount","source_index":2}],"row_classifiers":[],"multiline_strategy":"same-cell","repeating":True}]
         evidence={"pages":[{"page_number":1,"tables":[{"bounding_box":{"x0":0,"y0":0,"x1":100,"y1":100,"page_width":100,"page_height":100},"rows":[{"cells":[{"text":"IGST"},{"text":"3"},{"text":"644.82"}]},{"cells":[{"text":"IGST"},{"text":"18"},{"text":"783.00"}]}]}]}]}
         rows=TemplateRuleEngine().extract(definition,evidence)["tax_buckets"]
         self.assertEqual([row["values"]["gst_rate"] for row in rows],["3","18"])
 
     def test_anchor_selection_is_explainable(self):
         definition=empty_definition("GENERIC"); definition["objects"]=[{"id":"anchor","type":"ANCHOR","field":"invoice_number","anchor_text":"Invoice No.","relationship":"RIGHT_OF","match_policy":"CASE_INSENSITIVE","tolerance":.05,"sample_value":"INV-7","page_policy":"PAGE_ANY"}]
-        evidence={"pages":[{"page_number":1,"text_blocks":[{"text":"invoice no.","bounding_box":{"x0":1,"y0":1,"x1":10,"y1":3}}]}]}
+        evidence={"pages":[{"page_number":1,"width":100,"height":100,"text_blocks":[{"text":"invoice no.","bounding_box":{"x0":1,"y0":1,"x1":10,"y1":3}},{"text":"INV-2026-88","bounding_box":{"x0":12,"y0":1,"x1":25,"y1":3}}]}]}
         field=TemplateRuleEngine().extract(definition,evidence)["fields"][0]
-        self.assertEqual(field["value"],"INV-7"); self.assertIn("RIGHT_OF",field["why"])
+        self.assertEqual(field["value"],"INV-2026-88");self.assertNotEqual(field["value"],"INV-7"); self.assertIn("RIGHT_OF",field["why"])
+
+    def test_anchor_never_reuses_sample_value_across_documents(self):
+        definition=empty_definition("GENERIC");definition["objects"]=[{"id":"anchor","type":"ANCHOR","field":"invoice_number","anchor_text":"Invoice No.","relationship":"RIGHT_OF","match_policy":"EXACT","tolerance":.02,"sample_value":"STATIC-BAD","page_policy":"PAGE_ANY"}]
+        def evidence(value):return {"pages":[{"page_number":1,"width":100,"height":100,"text_blocks":[{"text":"Invoice No.","bounding_box":{"x0":5,"y0":5,"x1":20,"y1":8}},{"text":value,"bounding_box":{"x0":22,"y0":5,"x1":40,"y1":8}}]}]}
+        engine=TemplateRuleEngine();first=engine.extract(definition,evidence("INV-A"))["fields"][0]["value"];second=engine.extract(definition,evidence("INV-B"))["fields"][0]["value"]
+        self.assertEqual((first,second),("INV-A","INV-B"));self.assertNotIn("STATIC-BAD",(first,second))
+
+    def test_table_boundaries_control_cell_assignment(self):
+        definition=empty_definition("GENERIC");definition["objects"]=[{"id":"table","type":"TABLE","table_type":"ITEM","box":{"x0":0,"y0":0,"x1":1,"y1":1},"page_policy":"PAGE_ANY","columns":[{"boundary":.5,"field":"left"},{"boundary":1,"field":"right"}],"row_classifiers":[],"multiline_strategy":"same-cell"}]
+        evidence={"pages":[{"page_number":1,"tables":[{"bounding_box":{"x0":0,"y0":0,"x1":100,"y1":100,"page_width":100,"page_height":100},"rows":[{"cells":[{"text":"A","bounding_box":{"x0":10,"y0":10,"x1":20,"y1":20,"page_width":100,"page_height":100}},{"text":"B","bounding_box":{"x0":70,"y0":10,"x1":80,"y1":20,"page_width":100,"page_height":100}}]}]}]}]}
+        values=TemplateRuleEngine().extract(definition,evidence)["item_rows"][0]["values"];self.assertEqual(values,{"left":"A","right":"B"})
+        definition["objects"][0]["columns"]=[{"boundary":.8,"field":"left"},{"boundary":1,"field":"right"}]
+        values=TemplateRuleEngine().extract(definition,evidence)["item_rows"][0]["values"];self.assertEqual(values,{"left":"A B","right":""})
 
     def test_derived_field_is_marked_and_has_no_fabricated_source(self):
         definition=empty_definition(); definition["derived_fields"]=[{"field":"taxable","formula":"line_total - tax","inputs":["line_total","tax"],"rounding":2}]

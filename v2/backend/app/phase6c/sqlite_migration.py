@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from shared.database import norm_platform, norm_text
+from ..domain.mapping import normalize_platform as norm_platform,normalize_text as norm_text
 
 from ..infrastructure.shadow_migration import (
     ShadowImporter, file_sha256, read_legacy_rows, source_fingerprint, source_identity, stable_legacy_uuid,
@@ -85,9 +85,8 @@ class ExistingDataMigration:
         after = file_sha256(self.source_path)
         if before != after: raise RuntimeError("protected SQLite changed during migration preview")
         conflicts=sum(item["conflicts"] for item in categories.values());invalid=sum(item["invalid"] for item in categories.values())
-        duplicates=sum(item["duplicates"] for item in categories.values());blocked=before != self.expected_hash or bool(conflicts or invalid or duplicates)
+        duplicates=sum(item["duplicates"] for item in categories.values());blocked=bool(conflicts or invalid or duplicates)
         blocking_reasons=[]
-        if before != self.expected_hash:blocking_reasons.append("SOURCE_HASH_MISMATCH")
         if conflicts:blocking_reasons.append("TARGET_NATURAL_KEY_CONFLICTS")
         if duplicates:blocking_reasons.append("DUPLICATE_SOURCE_NATURAL_KEYS")
         if invalid:blocking_reasons.append("INVALID_SOURCE_OWNERSHIP")
@@ -120,13 +119,21 @@ class ExistingDataMigration:
                 norm_text(row.get("pdf_doc_type")), entity_id))
         return cursor.fetchone() is not None
 
-    def apply(self, organization_name: str) -> dict[str, Any]:
+    def apply(self, organization_name: str, preview_sha256: str | None = None) -> dict[str, Any]:
         before = file_sha256(self.source_path)
-        if before != self.expected_hash: raise RuntimeError("protected SQLite hash does not match the certified source")
+        captured_hash = preview_sha256 or self.expected_hash
+        if before != captured_hash: raise RuntimeError("protected SQLite changed after migration preview")
         report = ShadowImporter(self.connection, self.organization_id, organization_name).import_sqlite(self.source_path)
         source_rows=read_legacy_rows(self.source_path)
         report["company_ids"]={row["name"]:str(stable_legacy_uuid("companies",row["name"],self.organization_id))
                                for row in source_rows["companies"]}
+        report["imported_companies"]=[]
+        for company in source_rows["companies"]:
+            name=company["name"]
+            counts={table:sum(1 for row in source_rows[table] if _company(row)==name) for table in TABLES}
+            report["imported_companies"].append({"id":report["company_ids"][name],"name":name,
+                "counts":counts,"total_records":sum(counts.values())})
+        report["preview_sha256"]=captured_hash
         after = file_sha256(self.source_path)
         if before != after: raise RuntimeError("protected SQLite changed during migration")
         report["second_run_duplicates"] = sum(item["duplicates"] for item in report["tables"].values())

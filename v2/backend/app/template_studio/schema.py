@@ -127,6 +127,8 @@ def validate_definition(definition: Any) -> dict[str, Any]:
                     raise TemplateInvalid(f"objects[{index}].columns[{column_index}] boundaries must ascend")
                 previous = boundary
                 _safe_text(column.get("field", ""), f"objects[{index}].columns[{column_index}].field", 100)
+                if "source_index" in column and (not isinstance(column["source_index"],int) or column["source_index"]<0 or column["source_index"]>99):
+                    raise TemplateInvalid(f"objects[{index}].columns[{column_index}].source_index is invalid")
             classifiers = item.get("row_classifiers", [])
             for classifier in classifiers:
                 if not isinstance(classifier, dict) or classifier.get("row_type") not in ROW_TYPES:

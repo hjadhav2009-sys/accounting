@@ -3,11 +3,14 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+import asyncio
+import io
 from unittest.mock import patch
 from datetime import date,datetime, timezone
+from decimal import Decimal
 from uuid import uuid4
 
-from v2.backend.app.security.passwords import PasswordPolicyError, hash_password, verify_password
+from v2.backend.app.security.passwords import PasswordPolicyError, dummy_verify, hash_password, verify_password
 from v2.backend.app.security.sessions import AuthenticationFailed, SessionRepository
 from v2.backend.app.infrastructure.postgres_migrations import apply_migrations
 from v2.backend.app.jobs.durable import DurableJobRepository
@@ -18,19 +21,19 @@ from v2.backend.app.infrastructure.backup import create_backup,restore_backup,ve
 from v2.backend.app.infrastructure.service_health import collect_health
 from v2.backend.app.config.settings import Settings
 from v2.backend.app.infrastructure.postgres import psycopg_connection_factory,psycopg_tenant_connection_factory
-from v2.backend.app.services.accounting_exports import excel_preview,safe_export_filename
-from v2.backend.app.services.legacy import LegacyExcelExportService
-from tests.v2.test_phase3 import SUJAL_TEXT,pdf_with_text
-from v2.backend.app.services.accounting_workflows import bank_xml,marketplace_xml,reconcile_bank_rows
+from v2.backend.app.services.accounting_exports import excel_preview,export_excel,safe_export_filename
+from v2.backend.app.services.accounting_workflows import MoneyParseError,_money,bank_xml,marketplace_xml,reconcile_bank_rows
 from v2.backend.app.security.masters import MasterRepository
 from v2.backend.app.document_intelligence.repository import DocumentRepository
 from v2.backend.app.document_intelligence.models import DocumentStatus
 from fastapi import HTTPException
-from v2.backend.app.api.document_routes import RequestContext,bank_document_preview,document_content,document_excel,document_excel_preview,marketplace_document_preview
+from v2.backend.app.api.document_routes import (MAX_UPLOAD_BYTES,ROUTE_PERMISSION_MATRIX,RequestContext,
+    bank_document_preview,document_content,document_excel,document_excel_preview,marketplace_document_preview,
+    permission_dependency,read_bounded_upload,request_context)
 from v2.backend.app.api.admin_routes import disable_user
 from v2.backend.app.infrastructure.logging_config import SafeJsonFormatter
 from v2.backend.app.infrastructure.retention import apply_temporary_cleanup,retention_policy,temporary_cleanup_plan
-from v2.backend.app.domain.enums import Role
+from v2.backend.app.domain.enums import Permission,Role
 from tests.v2.rls_support import tenant_factory
 from tests.v2.rls_support import set_tenant
 
@@ -46,6 +49,77 @@ class PasswordSecurityTests(unittest.TestCase):
     def test_password_policy_rejects_short_and_common_values(self):
         for value in ("Short1!","password123"):
             with self.subTest(value=value),self.assertRaises(PasswordPolicyError): hash_password(value)
+
+    def test_unknown_user_dummy_hash_is_precomputed(self):
+        import inspect
+        source=inspect.getsource(dummy_verify)
+        self.assertNotIn("_HASHER.hash",source)
+        dummy_verify("attacker-controlled")
+
+    def test_non_development_runtime_fails_closed_without_secure_auth(self):
+        with self.assertRaisesRegex(RuntimeError,"PRODUCTION_AUTH_ENABLED"):
+            Settings(environment="production").validate_runtime_security()
+        Settings(environment="production",production_auth_enabled=True,session_cookie_secure=True,
+                 database_url="postgresql://configured").validate_runtime_security()
+
+    def test_permission_dependency_denies_viewer_upload_and_review(self):
+        viewer=RequestContext(uuid4(),uuid4(),uuid4(),frozenset({Role.VIEWER}))
+        for permission in (Permission.DOCUMENT_UPLOAD,Permission.DOCUMENT_REVIEW,Permission.TEMPLATE_CREATE):
+            with self.subTest(permission=permission),self.assertRaises(HTTPException) as raised:
+                permission_dependency(permission)(viewer)
+            self.assertEqual(raised.exception.status_code,403)
+        self.assertEqual(ROUTE_PERMISSION_MATRIX[("POST","/api/v2/documents/upload")],Permission.DOCUMENT_UPLOAD)
+        self.assertEqual(ROUTE_PERMISSION_MATRIX[("POST","/api/v2/reviews/{review_id}/resolve")],Permission.DOCUMENT_REVIEW)
+
+    def test_upload_reader_rejects_before_unbounded_body_read(self):
+        from starlette.datastructures import UploadFile
+        upload=UploadFile(io.BytesIO(b"x"*(MAX_UPLOAD_BYTES+1)),filename="large.pdf")
+        with self.assertRaises(HTTPException) as raised:asyncio.run(read_bounded_upload(upload))
+        self.assertEqual(raised.exception.status_code,413)
+
+    def test_next_document_has_security_headers(self):
+        config=(__import__('pathlib').Path(__file__).parents[2]/"v2/frontend/next.config.ts").read_text(encoding="utf-8")
+        for header in ("Content-Security-Policy","X-Content-Type-Options","X-Frame-Options","Permissions-Policy"):
+            self.assertIn(header,config)
+
+    def test_document_and_ai_route_permission_matrices_are_exhaustive(self):
+        from v2.backend.app.api.document_routes import router as document_router
+        from v2.backend.app.api.ai_routes import AI_ROUTE_PERMISSION_MATRIX,router as ai_router
+        from v2.backend.app.api.permission_matrix import API_PERMISSION_MATRIX
+        from v2.backend.app.main import app
+        document_paths={(method,path.path) for path in document_router.routes for method in path.methods}
+        ai_paths={(method,path.path) for path in ai_router.routes for method in path.methods}
+        self.assertEqual(document_paths,set(ROUTE_PERMISSION_MATRIX));self.assertEqual(ai_paths,set(AI_ROUTE_PERMISSION_MATRIX))
+        public_prefixes=("/api/v2/auth/","/api/v2/dev/");public_paths={"/health","/api/v2/system/info"}
+        protected={(method.upper(),path) for path,operations in app.openapi()["paths"].items()
+                   for method in operations if path.startswith("/api/v2/") and path not in public_paths
+                   and not path.startswith(public_prefixes)}
+        catalogued=set(ROUTE_PERMISSION_MATRIX)|set(AI_ROUTE_PERMISSION_MATRIX)|set(API_PERMISSION_MATRIX)
+        self.assertEqual(protected,catalogued-{("POST","/api/v2/documents")})
+
+    def test_launcher_uses_certified_health_and_strict_pid_ownership(self):
+        from pathlib import Path
+        start=Path("runtime/Start-BusinessAutomation.ps1").read_text(encoding="utf-8")
+        stop=Path("runtime/Stop-BusinessAutomation.ps1").read_text(encoding="utf-8")
+        for token in ("--api-key","LLAMA_CONTEXT_SIZE","LLAMA_THREADS","LLAMA_GPU_LAYERS","--no-webui","Wait-Healthy"):
+            self.assertIn(token,start)
+        for token in ("creation_time","command_hash","project_marker","ownedCommand -and $ownedExecutable -and $sameCreation -and $sameCommand"):
+            self.assertIn(token,stop)
+
+    def test_normal_v2_product_path_has_no_reference_service_import(self):
+        from pathlib import Path
+        for name in ("document_intelligence/pipeline.py","document_intelligence/routing.py",
+                     "services/accounting_exports.py","services/accounting_workflows.py","api/document_routes.py"):
+            source=Path("v2/backend/app",name).read_text(encoding="utf-8")
+            self.assertNotIn("services.legacy",source);self.assertNotIn("from .legacy",source)
+
+    def test_frontend_has_typed_error_client_and_no_mojibake(self):
+        from pathlib import Path
+        source=Path("v2/frontend/lib/api.ts").read_text(encoding="utf-8")
+        for token in ("class ApiError","apiRequest<T>","X-Request-ID","X-CSRF-Token","PERMISSION_DENIED"):
+            self.assertIn(token,source)
+        for path in Path("v2/frontend").rglob("*.tsx"):
+            text=path.read_text(encoding="utf-8");self.assertNotRegex(text,r"[ÃÂ]|â[€“€¦]")
 
     def test_backup_is_encrypted_and_integrity_verified(self):
         import subprocess
@@ -70,11 +144,14 @@ class PasswordSecurityTests(unittest.TestCase):
 
     def test_certified_pdf_to_excel_preview_and_workbook(self):
         from pathlib import Path
-        preview=excel_preview(pdf_with_text(SUJAL_TEXT),"synthetic-invoice.pdf",{})
-        self.assertEqual(preview["template"],"sujal_tax_invoice");self.assertGreaterEqual(preview["summary"]["rows"],1)
+        normalized={"invoice_number":"INV-1","invoice_date":"2026-08-01","supplier":"Synthetic",
+            "items":[{"description":"Item","hsn_sac":"6109","quantity":"2","unit_rate":"50","taxable":"100","total":"118"}],
+            "tax_buckets":[{"base_partition_id":"line-1","rate":"18","taxable":"100","hsn_sac":"6109"}]}
+        preview=excel_preview(b"not-read-by-v2-export","synthetic-invoice.pdf",normalized)
+        self.assertEqual(preview["template"],"V2_NATIVE");self.assertEqual(preview["summary"]["rows"],1)
         self.assertEqual(safe_export_filename("../unsafe invoice.pdf"),"unsafe_invoice.xlsx")
         with tempfile.TemporaryDirectory() as directory:
-            output=Path(directory,"verified.xlsx");LegacyExcelExportService().export(preview["rows"],preview["item_rows"],output)
+            output=Path(directory,"verified.xlsx");export_excel(preview["rows"],preview["item_rows"],output)
             self.assertTrue(output.read_bytes().startswith(b"PK"))
 
     def test_marketplace_purchase_and_credit_note_xml_semantics(self):
@@ -93,8 +170,16 @@ class PasswordSecurityTests(unittest.TestCase):
               {"Txn Date":"02/08/2026","Description":"Synthetic payment","Deposit":"0","Withdrawal":"40.00","Balance":"1060.00","Mapped Ledger":"Expense","Status":"OK"}]
         reconciliation=reconcile_bank_rows(rows);self.assertEqual(reconciliation["status"],"VERIFIED");self.assertEqual(reconciliation["difference"],"0.00")
         broken=[*rows[:-1],{**rows[-1],"Balance":"1061.00"}];self.assertEqual(reconcile_bank_rows(broken)["status"],"BLOCKED")
+        continuity=[rows[0],{**rows[1],"Balance":"1105.00","Deposit":"10.00","Withdrawal":"5.00"}]
+        self.assertEqual(reconcile_bank_rows(continuity)["status"],"REVIEW")
+        blank=[rows[0],{**rows[1],"Description":""}];self.assertEqual(reconcile_bank_rows(blank)["status"],"REVIEW")
         content=bank_xml({"export_allowed":True,"bank_account":{"bank_ledger":"Test Bank"},"rows":rows}).decode()
         self.assertIn("<VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME>",content);self.assertIn("<VOUCHERTYPENAME>Payment</VOUCHERTYPENAME>",content)
+
+    def test_malformed_nonblank_accounting_amount_never_becomes_zero(self):
+        with self.assertRaises(MoneyParseError) as raised:_money("INR-not-a-number","Taxable")
+        self.assertEqual(raised.exception.field,"Taxable");self.assertEqual(raised.exception.raw,"INR-not-a-number")
+        self.assertEqual(_money("","Taxable"),Decimal("0.00"))
 
     def test_structured_logging_redacts_secrets_and_retention_never_selects_originals(self):
         import json,logging,time

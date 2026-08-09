@@ -3,33 +3,41 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import tempfile
 from decimal import Decimal,ROUND_HALF_UP
-from pathlib import Path
 from typing import Any
 from uuid import UUID,uuid4
 from xml.sax.saxutils import escape
 
-from .legacy import LegacyMarketplaceService,LegacyBankStatementService
+from ..document_intelligence.validation import AccountingValidationEngine,BankBalanceValidator,InvoiceTotalValidator,RequiredFieldValidator
+from ..domain.mapping import mapping_matches,normalize_platform,normalize_text
 
 
-def _money(value:Any)->Decimal:
-    try:return Decimal(str(value or 0).replace(",","")).quantize(Decimal("0.01"),ROUND_HALF_UP)
-    except Exception:return Decimal("0.00")
+class MoneyParseError(ValueError):
+    def __init__(self,field:str,raw:Any)->None:
+        self.field,self.raw=field,raw
+        super().__init__(f"{field} contains a malformed accounting amount")
+
+
+def _money(value:Any,field:str="amount")->Decimal:
+    if value is None or (isinstance(value,str) and not value.strip()):return Decimal("0.00")
+    try:
+        parsed=Decimal(str(value).replace(",","").strip())
+        if not parsed.is_finite():raise ValueError("non-finite")
+        return parsed.quantize(Decimal("0.01"),ROUND_HALF_UP)
+    except Exception as exc:raise MoneyParseError(field,value) from exc
+
+
+def _normalize_money_fields(row:dict[str,Any],fields:tuple[str,...])->list[dict[str,Any]]:
+    errors=[]
+    for key in fields:
+        raw=row.get(key)
+        try:row[key]=str(_money(raw,key))
+        except MoneyParseError as exc:errors.append({"field":key,"raw_value":str(exc.raw),"code":"MALFORMED_MONEY"})
+    return errors
 
 
 def _match(text:str,pattern:str,match_type:str)->bool:
-    left=text.casefold();right=pattern.casefold()
-    if not right:return False
-    if match_type=="equals":return left==right
-    if match_type=="starts_with":return left.startswith(right)
-    if match_type=="regex":
-        try:return bool(re.search(pattern,text,re.I))
-        except re.error:return False
-    if match_type=="smart_contains":
-        normalized=lambda value:" ".join(re.sub(r"[^a-z0-9]+"," ",value.casefold()).split())
-        return normalized(pattern) in normalized(text)
-    return right in left
+    return mapping_matches(text,pattern,match_type)
 
 
 class AccountingWorkflowRepository:
@@ -93,7 +101,7 @@ class AccountingWorkflowRepository:
                     voucher_type,ledger,match_type,priority,enabled) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,0,true)
                     ON CONFLICT(company_id,tool,platform,pattern,voucher_type) DO UPDATE SET ledger=excluded.ledger,
                     match_type=excluded.match_type,enabled=true RETURNING id""",
-                    (mapping_id,organization_id,company_id,tool,platform.strip(),pattern.strip(),voucher_type.strip(),ledger.strip(),match_type))
+                    (mapping_id,organization_id,company_id,normalize_platform(tool),normalize_platform(platform),normalize_text(pattern),normalize_text(voucher_type),normalize_text(ledger),normalize_text(match_type).casefold()))
                 mapping_id=cursor.fetchone()[0]
                 cursor.execute("""INSERT INTO audit_logs(id,organization_id,company_id,actor_id,action,entity_type,
                     entity_id,new_reference,reason,source_context) VALUES(%s,%s,%s,%s,'MAPPING_CHANGED','ledger_mapping',
@@ -104,14 +112,24 @@ class AccountingWorkflowRepository:
         finally:connection.close()
 
 
-def marketplace_preview(content:bytes,filename:str,organization_id:UUID,company_id:UUID,repository:AccountingWorkflowRepository)->dict[str,Any]:
+def marketplace_preview(normalized:dict[str,Any],filename:str,organization_id:UUID,company_id:UUID,repository:AccountingWorkflowRepository)->dict[str,Any]:
     profile=repository.company_profile(organization_id,company_id)
     if not profile:raise ValueError("company is not available")
-    with tempfile.TemporaryDirectory(prefix="bap-marketplace-") as directory:
-        path=Path(directory)/"source.pdf";path.write_bytes(content)
-        frame=LegacyMarketplaceService().parse_pdf(path,profile["name"],filename)
-    rows=[]
-    for raw in frame.to_dict(orient="records"):
+    source_rows=list(normalized.get("marketplace_rows") or normalized.get("items") or [])
+    platform=str(normalized.get("platform") or "unknown");document_type=str(normalized.get("document_type") or "")
+    invoice=str(normalized.get("invoice_number") or "");date=str(normalized.get("invoice_date") or "")
+    native_rows=[]
+    for item in source_rows:
+        taxable=item.get("Taxable",item.get("taxable",""));cgst=item.get("CGST",item.get("cgst","0"))
+        sgst=item.get("SGST",item.get("sgst","0"));igst=item.get("IGST",item.get("igst","0"))
+        total=item.get("Total",item.get("total",""))
+        native_rows.append({"Source PDF":filename,"Platform":item.get("Platform",item.get("platform",platform)),
+            "PDF Doc Type":item.get("PDF Doc Type",item.get("document_type",document_type)),
+            "Description":item.get("Description",item.get("description","")),"Invoice No":item.get("Invoice No",invoice),
+            "Date":item.get("Date",date),"Taxable":taxable,"CGST":cgst,"SGST":sgst,"IGST":igst,"Total":total,
+            "Import?":item.get("Import?",True),"Issue":item.get("Issue","")})
+    rows=[];parse_errors=[]
+    for index,raw in enumerate(native_rows):
         row={key:("" if str(value)=="nan" else value) for key,value in raw.items()}
         platform=str(row.get("Platform") or "");document_type=str(row.get("PDF Doc Type") or "Tax Invoice")
         rule=repository.voucher_rule(organization_id,company_id,platform,document_type);row["Tally Voucher Type"]=rule["tally_voucher_type"]
@@ -124,12 +142,28 @@ def marketplace_preview(content:bytes,filename:str,organization_id:UUID,company_
         if str(row.get("Issue") or ""):issues.append(str(row["Issue"]))
         row["Status"]="OK" if not issues and bool(row.get("Import?",True)) else "REVIEW";row["Issue"]="; ".join(issues)
         row["Party Ledger"]=party;row["Sign Mode"]=rule["sign_mode"]
-        for key in ("Taxable","CGST","SGST","IGST","Total"):row[key]=str(_money(row.get(key)))
+        money_errors=_normalize_money_fields(row,("Taxable","CGST","SGST","IGST","Total"))
+        for error in money_errors:error["row"]=index+1
+        parse_errors.extend(money_errors)
+        if money_errors:row["Status"]="BLOCKED";row["Issue"]="; ".join(filter(None,[row.get("Issue",""),"MALFORMED_MONEY"]))
         rows.append(row)
     mapping_snapshot=hashlib.sha256(json.dumps([{key:row.get(key) for key in ("Platform","PDF Doc Type","Description","Mapped Ledger","Matched By","Tally Voucher Type")} for row in rows],sort_keys=True).encode()).hexdigest()
-    totals={key:str(sum((_money(row.get(key)) for row in rows),Decimal("0"))) for key in ("Taxable","CGST","SGST","IGST","Total")}
-    return {"rows":rows,"totals":totals,"validation_status":"VERIFIED" if rows and all(row["Status"]=="OK" for row in rows) else "REVIEW",
-        "mapping_snapshot_sha256":mapping_snapshot,"export_allowed":bool(rows and all(row["Status"]=="OK" for row in rows)),"profile":profile}
+    totals={key:(str(sum((_money(row.get(key),key) for row in rows),Decimal("0"))) if not any(error["field"]==key for error in parse_errors) else None) for key in ("Taxable","CGST","SGST","IGST","Total")}
+    canonical={"invoice_total":totals["Total"],"taxable_total":totals["Taxable"],
+        "tax_buckets":[{"tax_type":kind,"tax":row[kind],"taxable":row["Taxable"],"base_partition_id":f"row:{index}"}
+            for index,row in enumerate(rows) for kind in ("CGST","SGST","IGST") if not parse_errors and _money(row[kind],kind)],
+        "document_type":str(rows[0].get("PDF Doc Type") or "") if rows else ""}
+    accounting=AccountingValidationEngine((RequiredFieldValidator(("invoice_total",)),InvoiceTotalValidator())).validate(canonical) if rows and not parse_errors else None
+    classification_ok=all((str(row.get("PDF Doc Type")).casefold(),str(row.get("Tally Voucher Type")).casefold()) in
+        {("tax invoice","purchase"),("credit note","debit note")} for row in rows)
+    verified=bool(rows and not parse_errors and classification_ok and all(row["Status"]=="OK" for row in rows) and accounting and accounting.status=="VERIFIED")
+    status="VERIFIED" if verified else ("BLOCKED" if parse_errors or (accounting and accounting.status=="BLOCKED") else "REVIEW")
+    accounting_result=({"status":accounting.status,"findings":[{"validator":item.validator,"status":item.status,
+        "message":item.message,"error_code":item.error_code.value if item.error_code else None} for item in accounting.findings],
+        "calculations":accounting.calculations} if accounting else None)
+    return {"rows":rows,"totals":totals,"validation_status":status,"parse_errors":parse_errors,
+        "accounting_validation":accounting_result,"mapping_snapshot_sha256":mapping_snapshot,
+        "export_allowed":verified,"profile":profile}
 
 
 def _ledger_xml(ledger:str,amount:Decimal,party:bool=False)->str:
@@ -160,37 +194,59 @@ def marketplace_xml(preview:dict[str,Any])->bytes:
 
 def reconcile_bank_rows(rows:list[dict[str,Any]],tolerance:Decimal=Decimal("0.01"))->dict[str,Any]:
     if not rows:return {"opening":"0.00","credits":"0.00","debits":"0.00","calculated_closing":"0.00","statement_closing":"0.00","difference":"0.00","status":"REVIEW"}
-    credits=sum((_money(row.get("Deposit")) for row in rows),Decimal("0"));debits=sum((_money(row.get("Withdrawal")) for row in rows),Decimal("0"))
-    first=rows[0];opening=_money(first.get("Balance"))-_money(first.get("Deposit"))+_money(first.get("Withdrawal"))
-    statement=_money(rows[-1].get("Balance"));calculated=(opening+credits-debits).quantize(Decimal("0.01"));difference=(calculated-statement).quantize(Decimal("0.01"))
+    credits=sum((_money(row.get("Deposit"),"Deposit") for row in rows),Decimal("0"));debits=sum((_money(row.get("Withdrawal"),"Withdrawal") for row in rows),Decimal("0"))
+    first=rows[0];opening=_money(first.get("Balance"),"Balance")-_money(first.get("Deposit"),"Deposit")+_money(first.get("Withdrawal"),"Withdrawal")
+    statement=_money(rows[-1].get("Balance"),"Balance");calculated=(opening+credits-debits).quantize(Decimal("0.01"));difference=(calculated-statement).quantize(Decimal("0.01"))
+    transactions=[{"credit":row.get("Deposit"),"debit":row.get("Withdrawal"),"balance":row.get("Balance"),
+                   "narration":row.get("Description")} for row in rows]
+    report=AccountingValidationEngine((BankBalanceValidator(tolerance),)).validate({"opening_balance":opening,
+        "closing_balance":statement,"bank_transactions":transactions})
     return {"opening":str(opening),"credits":str(credits),"debits":str(debits),"calculated_closing":str(calculated),
-        "statement_closing":str(statement),"difference":str(difference),"status":"VERIFIED" if abs(difference)<=tolerance else "BLOCKED"}
+        "statement_closing":str(statement),"difference":str(difference),"status":report.status,
+        "findings":[{"validator":item.validator,"status":item.status,"message":item.message} for item in report.findings]}
 
 
-def bank_preview(content:bytes,filename:str,organization_id:UUID,company_id:UUID,repository:AccountingWorkflowRepository,
+def bank_preview(normalized:dict[str,Any],filename:str,organization_id:UUID,company_id:UUID,repository:AccountingWorkflowRepository,
                  tolerance:Decimal=Decimal("0.01"))->dict[str,Any]:
-    with tempfile.TemporaryDirectory(prefix="bap-bank-") as directory:
-        path=Path(directory)/"statement.pdf";path.write_bytes(content);frame,account_text=LegacyBankStatementService().load(path)
-    rows=[]
-    for raw in frame.to_dict(orient="records"):
+    source_rows=list(normalized.get("bank_transactions") or normalized.get("transactions") or normalized.get("items") or [])
+    account_text=json.dumps(normalized,default=str,ensure_ascii=False)
+    rows=[];parse_errors=[]
+    for index,item in enumerate(source_rows):
+        raw={"Txn Date":item.get("Txn Date",item.get("date","")),
+             "Description":item.get("Description",item.get("narration",item.get("description",""))),
+             "Withdrawal":item.get("Withdrawal",item.get("debit","0")),
+             "Deposit":item.get("Deposit",item.get("credit","0")),
+             "Balance":item.get("Balance",item.get("balance",""))}
         row={key:("" if str(value)=="nan" else value) for key,value in raw.items()};description=str(row.get("Description") or "")
-        transaction_type="Receipt" if _money(row.get("Deposit"))>0 else ("Payment" if _money(row.get("Withdrawal"))>0 else "")
+        money_errors=_normalize_money_fields(row,("Withdrawal","Deposit","Balance"))
+        for error in money_errors:error["row"]=index+1
+        parse_errors.extend(money_errors)
+        transaction_type=""
+        if not money_errors:transaction_type="Receipt" if _money(row.get("Deposit"),"Deposit")>0 else ("Payment" if _money(row.get("Withdrawal"),"Withdrawal")>0 else "")
         mappings=repository.mappings(organization_id,company_id,"bank","",transaction_type)
         matched=next((mapping for mapping in mappings if _match(description,mapping["pattern"],mapping["match_type"])),None)
-        row["Type"]=transaction_type;row["Mapped Ledger"]=matched["ledger"] if matched else "Suspense";row["Matched By"]=matched["pattern"] if matched else "UNMATCHED_TO_SUSPENSE";row["Status"]="OK" if matched and transaction_type else "REVIEW"
-        for key in ("Withdrawal","Deposit","Balance"):row[key]=str(_money(row.get(key)))
+        row["Type"]=transaction_type;row["Mapped Ledger"]=matched["ledger"] if matched else "Suspense";row["Matched By"]=matched["pattern"] if matched else "UNMATCHED_TO_SUSPENSE";row["Status"]="BLOCKED" if money_errors else ("OK" if matched and transaction_type else "REVIEW")
         rows.append(row)
     accounts=repository.bank_accounts(organization_id,company_id);selected=next((item for item in accounts if item["account_hint_token"] and str(item["account_hint_token"]) in account_text),accounts[0] if len(accounts)==1 else None)
-    reconciliation=reconcile_bank_rows(rows,tolerance);mapping_ok=bool(rows and all(row["Status"]=="OK" for row in rows));account_ok=bool(selected)
-    validation="VERIFIED" if reconciliation["status"]=="VERIFIED" and mapping_ok and account_ok else ("BLOCKED" if reconciliation["status"]=="BLOCKED" else "REVIEW")
+    try:reconciliation=reconcile_bank_rows(rows,tolerance) if not parse_errors else {"status":"BLOCKED","findings":[]}
+    except MoneyParseError:reconciliation={"status":"BLOCKED","findings":[]}
+    mapping_ok=bool(rows and all(row["Status"]=="OK" for row in rows));account_ok=bool(selected)
+    validation="VERIFIED" if reconciliation["status"]=="VERIFIED" and mapping_ok and account_ok else ("BLOCKED" if parse_errors or reconciliation["status"]=="BLOCKED" else "REVIEW")
     mapping_snapshot=hashlib.sha256(json.dumps([{key:row.get(key) for key in ("Description","Type","Mapped Ledger","Matched By")} for row in rows],sort_keys=True).encode()).hexdigest()
     return {"rows":rows,"reconciliation":reconciliation,"bank_account":{"id":selected["id"],"bank_ledger":selected["bank_ledger"],"account_hint":"••••"+str(selected["account_hint_token"])[-4:]} if selected else None,
-        "validation_status":validation,"mapping_snapshot_sha256":mapping_snapshot,"export_allowed":validation=="VERIFIED"}
+        "validation_status":validation,"parse_errors":parse_errors,"mapping_snapshot_sha256":mapping_snapshot,"export_allowed":validation=="VERIFIED"}
 
 
 def bank_xml(preview:dict[str,Any])->bytes:
     if not preview["export_allowed"]:raise ValueError("bank XML is blocked until reconciliation, account, and mappings are verified")
-    import pandas as pd
-    settings={"bank_ledger":preview["bank_account"]["bank_ledger"],"unmatched_ledger":"Suspense",
-        "voucher_number_prefix":"BANK-","create_missing_ledgers":False}
-    return LegacyBankStatementService().build_xml(pd.DataFrame(preview["rows"]),settings).encode("utf-8")
+    bank=str(preview["bank_account"]["bank_ledger"]);messages=[]
+    for index,row in enumerate(preview["rows"],1):
+        credit=_money(row.get("Deposit"),"Deposit");debit=_money(row.get("Withdrawal"),"Withdrawal")
+        voucher="Receipt" if credit>0 else "Payment";amount=credit if credit>0 else debit
+        counter=str(row.get("Mapped Ledger") or "");date=escape(str(row.get("Txn Date") or ""))
+        narration=escape(str(row.get("Description") or ""));bank_amount=amount if voucher=="Receipt" else -amount
+        entries=_ledger_xml(bank,bank_amount)+_ledger_xml(counter,-bank_amount)
+        messages.append(f'<TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER VCHTYPE="{voucher}" ACTION="Create"><DATE>{date}</DATE><VOUCHERTYPENAME>{voucher}</VOUCHERTYPENAME><VOUCHERNUMBER>BANK-{index:05d}</VOUCHERNUMBER><NARRATION>{narration}</NARRATION>{entries}</VOUCHER></TALLYMESSAGE>')
+    return ("<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC>"
+        "<REPORTNAME>Vouchers</REPORTNAME></REQUESTDESC><REQUESTDATA>"+"".join(messages)+
+        "</REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>").encode("utf-8")

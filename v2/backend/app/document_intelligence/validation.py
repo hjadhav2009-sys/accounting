@@ -18,6 +18,24 @@ def money(value: Any) -> Decimal:
     return decimal(value).quantize(CENT, rounding=ROUND_HALF_UP)
 
 
+def taxable_base_total(buckets: tuple[dict[str,Any],...] | list[dict[str,Any]]) -> Decimal:
+    """Count accounting bases, not tax components, while preserving identical source rows."""
+    total=Decimal("0");explicit:set[str]=set();unpaired:dict[tuple[str,str,Decimal],dict[str,int]]={}
+    for index,bucket in enumerate(buckets):
+        base=money(bucket.get("taxable"));partition=str(bucket.get("base_partition_id") or "").strip()
+        if partition:
+            if partition not in explicit:total+=base;explicit.add(partition)
+            continue
+        tax_type=str(bucket.get("tax_type") or "").upper()
+        key=(str(bucket.get("rate") or ""),str(bucket.get("hsn_sac") or ""),base)
+        if tax_type in {"CGST","SGST"}:
+            opposite="SGST" if tax_type=="CGST" else "CGST";counts=unpaired.setdefault(key,{"CGST":0,"SGST":0})
+            if counts[opposite]:counts[opposite]-=1
+            else:counts[tax_type]+=1;total+=base
+        else:total+=base
+    return money(total)
+
+
 class Validator(Protocol):
     name: str
     def validate(self, payload: dict[str, Any]) -> tuple[ValidationFinding, ...]: ...
@@ -99,13 +117,7 @@ class InvoiceTotalValidator:
         elif payload.get("items"):
             taxable = sum((money(item.get("taxable")) for item in payload.get("items", ())), Decimal("0"))
         else:
-            # CGST and SGST buckets often repeat the same taxable base. Count each
-            # rate/HSN/base partition once while preserving unlimited GST rates.
-            partitions = {
-                (str(bucket.get("rate") or ""), str(bucket.get("hsn_sac") or ""), money(bucket.get("taxable")))
-                for bucket in payload.get("tax_buckets", ())
-            }
-            taxable = sum((partition[2] for partition in partitions), Decimal("0"))
+            taxable = taxable_base_total(payload.get("tax_buckets", ()))
         tax = sum((money(bucket.get("tax")) for bucket in payload.get("tax_buckets", ())), Decimal("0"))
         adjustments = money(payload.get("adjustments"))
         round_off = money(payload.get("round_off"))
@@ -166,7 +178,7 @@ class AccountingValidationEngine:
         else:
             status = "VERIFIED"
         calculations = {
-            "taxable_total": str(sum((money(bucket.get("taxable")) for bucket in payload.get("tax_buckets", ())), Decimal("0"))),
+            "taxable_total": str(taxable_base_total(payload.get("tax_buckets", ()))),
             "tax_total": str(sum((money(bucket.get("tax")) for bucket in payload.get("tax_buckets", ())), Decimal("0"))),
         }
         return AccountingValidationReport(status, findings, calculations)

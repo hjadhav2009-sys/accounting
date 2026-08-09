@@ -102,6 +102,27 @@ def _intersects(first: dict[str, float], second: dict[str, float]) -> bool:
     return not (first["x1"] < second["x0"] or first["x0"] > second["x1"] or first["y1"] < second["y0"] or first["y0"] > second["y1"])
 
 
+def _center(box:dict[str,float])->tuple[float,float]:return ((box["x0"]+box["x1"])/2,(box["y0"]+box["y1"])/2)
+
+
+def _overlap(first:dict[str,float],second:dict[str,float])->float:
+    width=max(0.0,min(first["x1"],second["x1"])-max(first["x0"],second["x0"]))
+    height=max(0.0,min(first["y1"],second["y1"])-max(first["y0"],second["y0"]))
+    return width*height
+
+
+def _relationship_score(anchor:dict[str,float],candidate:dict[str,float],relationship:str,tolerance:float)->float|None:
+    ax,ay=_center(anchor);cx,cy=_center(candidate);vertical=min(anchor["y1"],candidate["y1"])-max(anchor["y0"],candidate["y0"])
+    horizontal=min(anchor["x1"],candidate["x1"])-max(anchor["x0"],candidate["x0"])
+    if relationship=="RIGHT_OF" and not (candidate["x0"]>=anchor["x1"]-tolerance and (vertical>=0 or abs(cy-ay)<=tolerance)):return None
+    if relationship=="LEFT_OF" and not (candidate["x1"]<=anchor["x0"]+tolerance and (vertical>=0 or abs(cy-ay)<=tolerance)):return None
+    if relationship=="BELOW" and not (candidate["y0"]>=anchor["y1"]-tolerance and (horizontal>=0 or abs(cx-ax)<=tolerance)):return None
+    if relationship=="ABOVE" and not (candidate["y1"]<=anchor["y0"]+tolerance and (horizontal>=0 or abs(cx-ax)<=tolerance)):return None
+    if relationship=="SAME_LINE" and not (vertical>=0 or abs(cy-ay)<=tolerance):return None
+    distance=((cx-ax)**2+(cy-ay)**2)**.5
+    return distance+(abs(cy-ay) if relationship in {"RIGHT_OF","LEFT_OF","SAME_LINE"} else abs(cx-ax))
+
+
 class TemplateRuleEngine:
     """Deterministic extraction over certified page evidence; never executes template code."""
 
@@ -122,7 +143,10 @@ class TemplateRuleEngine:
             return page_number == item.get("page", 1)
 
         def is_ignored(page_number: int, box: dict[str, float] | None) -> bool:
-            return bool(box and any(on_page(region, page_number) and _intersects(box, region["box"]) for region in ignored))
+            if not box:return False
+            area=max((box["x1"]-box["x0"])*(box["y1"]-box["y0"]),1e-9);cx,cy=_center(box)
+            return any(on_page(region,page_number) and (_overlap(box,region["box"])/area>=.5 or
+                (region["box"]["x0"]<=cx<=region["box"]["x1"] and region["box"]["y0"]<=cy<=region["box"]["y1"])) for region in ignored)
 
         for rule in definition["objects"]:
             if rule["type"] != "FIELD":
@@ -137,19 +161,27 @@ class TemplateRuleEngine:
             if not candidates:
                 warnings.append(f"{rule['field']}: no source in mapped region")
                 continue
-            chosen = max(candidates, key=lambda item: float(item.get("confidence") or 0))
+            def field_score(item:dict[str,Any])->tuple[float,float,float]:
+                source_box=_normalized_box(item.get("source") or {}) or rule["box"]
+                overlap=_overlap(source_box,rule["box"]);area=max((source_box["x1"]-source_box["x0"])*(source_box["y1"]-source_box["y0"]),1e-9)
+                sx,sy=_center(source_box);rx,ry=_center(rule["box"])
+                return (overlap/area,-((sx-rx)**2+(sy-ry)**2),float(item.get("confidence") or 0))
+            chosen = max(candidates, key=field_score)
             value: Any = chosen.get("value", chosen.get("text", ""))
             for transform in rule.get("transforms", []):
                 value = apply_transform(value, transform)
             fields.append({"field": rule["field"], "value": str(value), "source": chosen.get("source"),
-                           "rule_id": rule["id"], "why": "highest-confidence evidence intersecting mapped region",
+                           "rule_id": rule["id"], "why": "best overlap and distance within mapped region",
                            "transforms": rule.get("transforms", []), "derived": False})
 
         text_blocks: list[dict[str, Any]] = []
         for page in pages:
             page_number = int(page.get("page_number") or 1)
             for block in page.get("text_blocks", page.get("blocks", [])):
-                text_blocks.append({**block, "page_number": page_number})
+                box=block.get("bounding_box") or block.get("box")
+                if isinstance(box,dict) and not all(key in box for key in ("page_width","page_height")):
+                    box={**box,"page_width":page.get("width",1),"page_height":page.get("height",1)}
+                text_blocks.append({**block,"bounding_box":box,"page_number":page_number})
         for anchor in (item for item in definition["objects"] if item["type"] == "ANCHOR"):
             wanted = anchor["anchor_text"]
             policy = anchor.get("match_policy", "EXACT")
@@ -159,11 +191,26 @@ class TemplateRuleEngine:
                 matched = actual == wanted if policy == "EXACT" else actual.casefold() == wanted.casefold()
                 if policy == "NORMALIZED_PUNCTUATION":
                     matched = re.sub(r"[^\w]+", "", actual).casefold() == re.sub(r"[^\w]+", "", wanted).casefold()
-                if matched and on_page(anchor, block["page_number"]): matches.append(block)
+                block_box=_normalized_box({"bounding_box":block.get("bounding_box")})
+                if matched and on_page(anchor, block["page_number"]) and block_box and not is_ignored(block["page_number"],block_box): matches.append(block)
             if not matches: warnings.append(f"anchor '{wanted}' not found")
-            else: fields.append({"field": anchor.get("field", "anchor_value"), "value": anchor.get("sample_value", ""),
-                "source": {"page_number": matches[0]["page_number"], "bounding_box": matches[0].get("bounding_box")},
-                "rule_id": anchor["id"], "why": f"{anchor['relationship']} anchor '{wanted}'", "derived": False})
+            else:
+                candidates=[];tolerance=float(anchor.get("tolerance",0));relationship=anchor["relationship"]
+                for matched_anchor in matches:
+                    anchor_box=_normalized_box({"bounding_box":matched_anchor.get("bounding_box")})
+                    if not anchor_box:continue
+                    for candidate in text_blocks:
+                        if candidate is matched_anchor or candidate["page_number"]!=matched_anchor["page_number"]:continue
+                        candidate_box=_normalized_box({"bounding_box":candidate.get("bounding_box")})
+                        if not candidate_box or is_ignored(candidate["page_number"],candidate_box):continue
+                        score=_relationship_score(anchor_box,candidate_box,relationship,tolerance)
+                        if score is not None and str(candidate.get("text") or "").strip():candidates.append((score,candidate))
+                if not candidates:warnings.append(f"anchor '{wanted}' has no {relationship} value evidence")
+                else:
+                    _,chosen=min(candidates,key=lambda item:item[0])
+                    fields.append({"field":anchor.get("field","anchor_value"),"value":str(chosen.get("text") or "").strip(),
+                        "source":{"page_number":chosen["page_number"],"bounding_box":chosen.get("bounding_box")},
+                        "rule_id":anchor["id"],"why":f"nearest geometric {relationship} evidence for anchor '{wanted}'","derived":False})
 
         for table_rule in (item for item in definition["objects"] if item["type"] == "TABLE"):
             extracted_rows: list[dict[str, Any]] = []
@@ -172,11 +219,22 @@ class TemplateRuleEngine:
                 if not on_page(table_rule, page_number): continue
                 for table in page.get("tables", []):
                     table_box = _normalized_box({"bounding_box": table.get("bounding_box")})
-                    if not table_box or not _intersects(table_box, table_rule["box"]): continue
+                    if not table_box or not _intersects(table_box, table_rule["box"]) or is_ignored(page_number,table_box): continue
                     for row in table.get("rows", []):
                         cells = row.get("cells", [])
-                        mapped = {column["field"]: (cells[index].get("text", "") if index < len(cells) else "")
-                                  for index, column in enumerate(table_rule.get("columns", []))}
+                        mapped={};previous=0.0
+                        for column in table_rule.get("columns",[]):
+                            boundary=float(column["boundary"]);selected=[]
+                            if "source_index" in column:
+                                source_index=int(column["source_index"]);selected=[cells[source_index]] if source_index<len(cells) else []
+                            else:
+                                for cell in cells:
+                                    cell_box=_normalized_box({"bounding_box":cell.get("bounding_box")})
+                                    if not cell_box or is_ignored(page_number,cell_box):continue
+                                    relative=(_center(cell_box)[0]-table_rule["box"]["x0"])/max(table_rule["box"]["x1"]-table_rule["box"]["x0"],1e-9)
+                                    if previous<=relative<=(boundary if boundary==1 else boundary):selected.append(cell)
+                            mapped[column["field"]]=" ".join(str(cell.get("text","")).strip() for cell in selected if str(cell.get("text","")).strip())
+                            previous=boundary
                         joined = " ".join(str(cell.get("text", "")) for cell in cells)
                         row_type = "ITEM"
                         for classifier in table_rule.get("row_classifiers", []):

@@ -101,6 +101,19 @@ class SemanticParityTests(unittest.TestCase):
 
 
 class MigrationPreviewSafetyTests(unittest.TestCase):
+    @unittest.skipUnless(
+        (ROOT / "data" / "business_rules.db").exists(),
+        "private authoritative SQLite source is intentionally unavailable",
+    )
+    def test_current_authoritative_source_has_expected_company_mapping_partition(self):
+        source=ROOT/"data"/"business_rules.db"
+        self.assertEqual(file_sha256(source).upper(),"87E55412BB10C7D953E3F971F45F455E3A7769D179C9DE2D84575BF47616AE5E")
+        report=ExistingDataMigration(_PreviewConnection(),uuid4(),source,file_sha256(source)).preview()
+        self.assertEqual(report["totals"],{"companies":3,"bank_accounts":4,"party_ledgers":26,
+            "ledger_mappings":144,"voucher_rules":42})
+        self.assertEqual({name:value["ledger_mappings"] for name,value in report["company_counts"].items()},
+            {"Default Company":51,"SUJAL FASHION WORKS":28,"Shiv Jagdamba":65})
+
     def test_preview_is_read_only_company_scoped_and_hash_stable(self):
         with tempfile.TemporaryDirectory() as directory:
             source=Path(directory)/"source.db";create_source(source);before=source.read_bytes();digest=file_sha256(source)
@@ -109,6 +122,14 @@ class MigrationPreviewSafetyTests(unittest.TestCase):
         self.assertTrue(report["apply_allowed"]);self.assertEqual(report["totals"]["companies"],2)
         self.assertEqual(report["company_counts"]["Company A"]["ledger_mappings"],1)
         self.assertEqual(report["company_counts"]["Company B"]["ledger_mappings"],1)
+
+    def test_apply_is_bound_to_preview_hash_not_a_universal_customer_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory)/"source.db";create_source(source);digest=file_sha256(source)
+            migration=ExistingDataMigration(_PreviewConnection(),uuid4(),source,"different-certified-history")
+            self.assertTrue(migration.preview()["apply_allowed"])
+            with self.assertRaisesRegex(RuntimeError,"changed after migration preview"):
+                migration.apply("Synthetic",preview_sha256="0"*64)
 
     def test_stable_identity_is_same_on_second_run_and_tenant_specific(self):
         first,other=uuid4(),uuid4()
@@ -131,6 +152,11 @@ class MigrationPreviewSafetyTests(unittest.TestCase):
         migration=(ROOT/"v2/frontend/components/DataMigrationWorkspace.tsx").read_text(encoding="utf-8")
         parity=(ROOT/"v2/frontend/components/ParityWorkspace.tsx").read_text(encoding="utf-8")
         self.assertIn("Run validation preview",migration);self.assertIn("Confirm migration",migration)
+        self.assertIn("COMPANY_ACCESS_CHANGED",migration);self.assertIn("Applied result preserved",migration)
+        company_switcher=(ROOT/"v2/frontend/components/CompanySwitcher.tsx").read_text(encoding="utf-8")
+        self.assertIn("addEventListener(COMPANY_ACCESS_CHANGED",company_switcher)
+        masters=(ROOT/"v2/frontend/components/MastersWorkspace.tsx").read_text(encoding="utf-8")
+        self.assertIn("Active company",masters)
         self.assertIn("Reference calls from V2_NATIVE",parity);self.assertIn("Run independent comparison",parity)
         repository=(ROOT/"v2/backend/app/phase6c/repository.py").read_text(encoding="utf-8")
         self.assertIn("ensure_v2_draft",repository);self.assertIn("human_approval_required",repository)
@@ -158,6 +184,8 @@ class Phase6CPostgresTests(unittest.TestCase):
             first=migration.apply("Importer must not rename this organization");second=migration.apply("Importer must not rename this organization");connection.close()
         self.assertTrue(all(item["inserted"]==2 for item in first["tables"].values()))
         self.assertTrue(all(item["duplicates"]==0 for item in second["tables"].values()))
+        self.assertEqual({item["name"]:item["counts"]["ledger_mappings"] for item in first["imported_companies"]},
+                         {"Company A":1,"Company B":1})
         company_a=stable_legacy_uuid("companies","Company A",organization);company_b=stable_legacy_uuid("companies","Company B",organization)
         repo_a=PostgresRepositories(tenant_factory(self.url,organization,company_a),organization)
         repo_b=PostgresRepositories(tenant_factory(self.url,organization,company_b),organization)

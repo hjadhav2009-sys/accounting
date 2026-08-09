@@ -3,11 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-
-from ..document_intelligence.native_pdf import NativePdfExtractor
-from ..document_intelligence.security import ResourceLimits
-from .legacy import LegacyPdfToExcelService
-
+from openpyxl import Workbook
 
 EXCEL_COLUMNS=("DATE","INVOICE NO(Invoice Id).","GSTIN( from ship to )",
     "TRADE NAME( from Ship To Shiv Jagdamba,)","RATE","TAXABLE","HSN CODE","QTY",
@@ -36,17 +32,26 @@ def normalized_excel_rows(normalized:dict[str,Any],source_file:str)->tuple[list[
 
 
 def excel_preview(content:bytes,source_file:str,normalized:dict[str,Any])->dict[str,Any]:
-    pages=NativePdfExtractor().extract(content,ResourceLimits())
-    text="\n".join(page.text for page in pages);legacy=LegacyPdfToExcelService();template=legacy.detect_template(text)
-    rows,item_rows=legacy.parse_text(template,text,source_file) if template!="unknown" else ([],[])
-    if not rows:rows,item_rows=normalized_excel_rows(normalized,source_file)
+    rows,item_rows=normalized_excel_rows(normalized,source_file)
     taxable=sum((_decimal(row.get("TAXABLE")) for row in rows),Decimal("0"))
     quantity=sum((_decimal(row.get("QTY")) for row in rows),Decimal("0"))
     total=sum((_decimal(item.get("total")) for item in item_rows),Decimal("0"))
-    return {"template":template,"columns":list(EXCEL_COLUMNS),"rows":rows,"item_rows":item_rows,
+    return {"template":"V2_NATIVE","columns":list(EXCEL_COLUMNS),"rows":rows,"item_rows":item_rows,
         "summary":{"rows":len(rows),"quantity":str(quantity),"taxable":str(taxable),"total":str(total)}}
 
 
 def safe_export_filename(source_file:str)->str:
     stem="".join(character if character.isalnum() or character in "-_" else "_" for character in Path(source_file).stem).strip("_")
     return f"{stem or 'accounting_export'}.xlsx"
+
+
+def export_excel(rows:list[dict[str,Any]],item_rows:list[dict[str,Any]],output_path:str|Path)->Path:
+    """Write normalized V2 rows without invoking a reference parser or exporter."""
+    destination=Path(output_path);workbook=Workbook();summary=workbook.active;summary.title="Accounting Summary"
+    summary.append(list(EXCEL_COLUMNS))
+    for row in rows:summary.append([row.get(column,"") for column in EXCEL_COLUMNS])
+    items=workbook.create_sheet("Item Details");columns=tuple(item_rows[0]) if item_rows else (
+        "source_file","invoice_id","date","description","hsn","qty","unit","unit_price","taxable","total")
+    items.append(list(columns))
+    for row in item_rows:items.append([row.get(column,"") for column in columns])
+    workbook.save(destination);return destination

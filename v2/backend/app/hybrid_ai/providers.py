@@ -29,6 +29,15 @@ class LocalAiService:
         if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("local AI endpoint must use HTTP on loopback")
 
+    def healthy(self) -> bool:
+        parsed=urlparse(self.endpoint);health=f"{parsed.scheme}://{parsed.netloc}/health"
+        try:
+            headers={};
+            if self.api_key:headers["Authorization"]=f"Bearer {self.api_key}"
+            with urlopen(Request(health,headers=headers),timeout=min(3,self.timeout_seconds)) as response:
+                return 200<=getattr(response,"status",200)<300
+        except (OSError,HTTPError,URLError,TimeoutError):return False
+
     def complete(self, messages: list[dict[str, str]], response_schema: dict[str, Any]) -> ProviderResult:
         started = time.monotonic()
         # llama.cpp's OpenAI-compatible server expects the JSON Schema in the

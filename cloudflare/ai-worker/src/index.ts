@@ -7,6 +7,7 @@ const MAX_IMAGE_BYTES = 256 * 1024;
 const SIGNATURE_WINDOW_SECONDS = 300;
 const HEX_SHA256 = /^[a-f0-9]{64}$/;
 const IMAGE_DATA_URL = /^data:image\/(?:png|jpeg|webp);base64,([A-Za-z0-9+/]+={0,2})$/;
+const USAGE_METADATA_VERSION = "cloudflare-workers-ai-2026-08-09-v1";
 
 export const MODEL_BY_ROLE = {
   TEXT_TOOL_MODEL: "@cf/zai-org/glm-4.7-flash",
@@ -46,6 +47,7 @@ const PROPOSAL_SCHEMA: Record<string, unknown> = {
           source: { type: "string" }, value_type: { type: "string" }, selector: { type: "string" },
           anchor: { type: "string" }, table: { type: "string" },
           columns: { type: "array", maxItems: 30, items: { type: "string" } },
+          unmapped_columns: { type: "boolean" },
           change: { type: "string" }, expected: { type: "string" },
         } },
         rationale: { type: "string", maxLength: 1000 },
@@ -66,7 +68,9 @@ const VISION_SCHEMA: Record<string, unknown> = {
       type: "object", additionalProperties: false, required: ["role", "selector", "confidence"],
       properties: {
         role: { type: "string", enum: [
-          "invoice_number", "date", "item_table", "quantity", "gst", "amount",
+          "invoice_number", "date", "supplier", "party_ledger", "item_table", "quantity", "rate",
+          "taxable", "hsn_sac", "gst_rate", "gst_amount", "invoice_total", "marketplace_reference",
+          "bank_transaction_table", "opening_balance", "closing_balance", "narration", "debit", "credit", "balance",
         ] },
         selector: { type: "string", maxLength: 500 },
         confidence: { type: "string", enum: ["HIGH", "MEDIUM", "LOW"] },
@@ -248,15 +252,17 @@ function visionToProposal(value: unknown): unknown {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return value;
     const region = raw as Record<string, unknown>;
     if (Object.keys(region).some((key) => !["role", "selector", "confidence"].includes(key)) ||
-        !["invoice_number", "date", "item_table", "quantity", "gst", "amount"].includes(String(region.role)) ||
+        !["invoice_number","date","supplier","party_ledger","item_table","quantity","rate","taxable","hsn_sac",
+          "gst_rate","gst_amount","invoice_total","marketplace_reference","bank_transaction_table","opening_balance",
+          "closing_balance","narration","debit","credit","balance"].includes(String(region.role)) ||
         typeof region.selector !== "string" || region.selector.length > 500 ||
         !["HIGH", "MEDIUM", "LOW"].includes(String(region.confidence))) return value;
     const role = String(region.role);
     actions.push({
-      action: role === "item_table" ? "create_table" : "create_field",
-      payload: role === "item_table"
-        ? { table: "items", role, source: "sanitized_vision", selector: region.selector,
-            columns: ["item", "hsn", "quantity", "gst", "amount"] }
+      action: ["item_table","bank_transaction_table"].includes(role) ? "create_table" : "create_field",
+      payload: ["item_table","bank_transaction_table"].includes(role)
+        ? { table: role === "item_table" ? "items" : "bank_transactions", role,
+            source: "sanitized_vision", selector: region.selector, columns: [], unmapped_columns: true }
         : { field: role, role, source: "sanitized_vision", selector: region.selector },
       rationale: `Sanitized vision identified the ${role} region.`,
       source_references: ["sanitized-page:1"],
@@ -282,6 +288,7 @@ function usageFrom(output: unknown, modelRole: ModelRole): Record<string, unknow
   // This intentionally over-reserves. It is an application estimate, never provider-reported truth.
   const conservativeEstimate = Math.max(25, calculated * 2);
   return {
+    usage_metadata_version: USAGE_METADATA_VERSION,
     input_tokens: inputTokens,
     output_tokens: outputTokens,
     provider_reported_neurons: null,

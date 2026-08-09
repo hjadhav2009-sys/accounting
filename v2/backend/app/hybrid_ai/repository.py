@@ -62,11 +62,13 @@ class AiRepository:
                      json.dumps({"state":state,"raw_payload_retained":False})))
             return job
 
-    def cancel_job(self, organization_id: UUID, company_id: UUID, job_id: UUID) -> bool:
+    def cancel_job(self, organization_id: UUID, company_id: UUID, job_id: UUID,
+                   actor_id: UUID | None = None, privileged: bool = False) -> bool:
         with self._cursor() as cursor:
             cursor.execute("""UPDATE ai_jobs SET cancel_requested=true,status='CANCELLED',completed_at=now()
-                WHERE id=%s AND organization_id=%s AND company_id=%s AND status IN ('QUEUED','RUNNING')""",
-                (job_id,organization_id,company_id))
+                WHERE id=%s AND organization_id=%s AND company_id=%s AND status IN ('QUEUED','RUNNING')
+                  AND (created_by=%s OR %s::boolean)""",
+                (job_id,organization_id,company_id,actor_id,privileged))
             return cursor.rowcount == 1
 
     def queue_until_reset(self, organization_id: UUID, company_id: UUID, job_id: UUID,

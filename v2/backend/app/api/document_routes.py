@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Annotated
+from typing import Annotated, Callable
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Cookie, Depends, File, Header, HTTPException, Query, Request, Response, UploadFile
@@ -21,11 +21,12 @@ from ..security.sessions import SessionRepository
 from ..jobs.durable import DurableJobRepository
 from ..domain.enums import Permission
 from ..security.authorization import AuthorizationService
-from ..services.accounting_exports import excel_preview,safe_export_filename
-from ..services.legacy import LegacyExcelExportService
+from ..services.accounting_exports import excel_preview,export_excel,safe_export_filename
 from ..services.accounting_workflows import AccountingWorkflowRepository,bank_preview,bank_xml,marketplace_preview,marketplace_xml
 import hashlib
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 
@@ -60,6 +61,8 @@ def request_context(
         if request.method not in {"GET","HEAD","OPTIONS"} and not identity.csrf_token_valid:
             raise HTTPException(403,"CSRF validation failed")
         return RequestContext(identity.organization_id,identity.company_id,identity.user_id,identity.roles)
+    if settings.environment not in {"development","test"}:
+        raise HTTPException(503,"production authentication is required")
     if not header_organization_id or not header_company_id or not header_user_id:
         raise HTTPException(401,"development identity headers are required")
     parsed: set[Role] = set()
@@ -69,6 +72,76 @@ def request_context(
         except ValueError:
             continue
     return RequestContext(header_organization_id, header_company_id, header_user_id, frozenset(parsed or {Role.VIEWER}))
+
+
+def permission_dependency(permission: Permission) -> Callable[..., RequestContext]:
+    """Single route boundary for role-to-capability enforcement."""
+    def dependency(context: Annotated[RequestContext, Depends(request_context)]) -> RequestContext:
+        if not AuthorizationService().is_allowed(set(context.roles),permission):
+            raise HTTPException(403,"permission denied")
+        return context
+    dependency.__name__=f"require_{permission.value.replace('.','_')}"
+    return dependency
+
+
+ROUTE_PERMISSION_MATRIX: dict[tuple[str,str],Permission] = {
+    ("POST","/api/v2/documents"):Permission.DOCUMENT_UPLOAD,
+    ("POST","/api/v2/documents/upload"):Permission.DOCUMENT_UPLOAD,
+    ("POST","/api/v2/documents/batch"):Permission.DOCUMENT_UPLOAD,
+    ("GET","/api/v2/batches/{batch_id}"):Permission.DOCUMENT_VIEW,
+    ("GET","/api/v2/batches/{batch_id}/documents"):Permission.DOCUMENT_VIEW,
+    ("GET","/api/v2/documents"):Permission.DOCUMENT_VIEW,
+    ("GET","/api/v2/documents/{document_id}"):Permission.DOCUMENT_VIEW,
+    ("GET","/api/v2/documents/{document_id}/content"):Permission.DOCUMENT_VIEW,
+    ("GET","/api/v2/documents/{document_id}/pages"):Permission.DOCUMENT_VIEW,
+    ("GET","/api/v2/documents/{document_id}/pages/{page_number}/image"):Permission.DOCUMENT_VIEW,
+    ("GET","/api/v2/documents/{document_id}/extraction"):Permission.DOCUMENT_VIEW,
+    ("GET","/api/v2/documents/{document_id}/validation"):Permission.DOCUMENT_VIEW,
+    ("GET","/api/v2/documents/{document_id}/excel-preview"):Permission.DOCUMENT_VIEW,
+    ("POST","/api/v2/documents/{document_id}/excel"):Permission.EXCEL_EXPORT,
+    ("GET","/api/v2/exports"):Permission.DOCUMENT_VIEW,
+    ("GET","/api/v2/marketplace/{document_id}/preview"):Permission.MARKETPLACE_PROCESS,
+    ("POST","/api/v2/mappings"):Permission.MAPPING_EDIT,
+    ("POST","/api/v2/marketplace/{document_id}/xml"):Permission.XML_EXPORT,
+    ("GET","/api/v2/bank/{document_id}/preview"):Permission.BANK_PROCESS,
+    ("POST","/api/v2/bank/{document_id}/xml"):Permission.XML_EXPORT,
+    ("GET","/api/v2/reviews"):Permission.DOCUMENT_REVIEW,
+    ("POST","/api/v2/reviews/{review_id}/resolve"):Permission.DOCUMENT_REVIEW,
+    ("GET","/api/v2/reports/document-intelligence"):Permission.DOCUMENT_VIEW,
+    ("GET","/api/v2/reports/unified"):Permission.DOCUMENT_VIEW,
+    ("GET","/api/v2/financial-years"):Permission.DOCUMENT_VIEW,
+    ("GET","/api/v2/reports/format-health"):Permission.DOCUMENT_VIEW,
+}
+
+
+class _UploadRateLimiter:
+    def __init__(self, maximum_files:int=60, window_seconds:int=300)->None:
+        self.maximum_files=maximum_files;self.window_seconds=window_seconds;self._lock=threading.Lock();self._events:dict[UUID,list[float]]={}
+    def require(self,user_id:UUID,count:int)->None:
+        now=time.monotonic();cutoff=now-self.window_seconds
+        with self._lock:
+            events=[value for value in self._events.get(user_id,[]) if value>=cutoff]
+            if len(events)+count>self.maximum_files:raise HTTPException(429,"document upload rate limit exceeded")
+            self._events[user_id]=events+[now]*count
+
+
+_UPLOAD_LIMITER=_UploadRateLimiter()
+_PAGE_RENDER_LOCK=threading.Lock()
+_PAGE_RENDER_CACHE:dict[tuple[UUID,UUID,UUID,int],tuple[float,bytes]]={}
+_PAGE_RENDER_LIMITER=_UploadRateLimiter(maximum_files=120,window_seconds=300)
+MAX_UPLOAD_BYTES=25*1024*1024
+MAX_BATCH_BYTES=250*1024*1024
+
+
+async def read_bounded_upload(file:UploadFile,maximum_bytes:int=MAX_UPLOAD_BYTES)->bytes:
+    chunks=[];total=0
+    while True:
+        chunk=await file.read(min(1024*1024,maximum_bytes-total+1))
+        if not chunk:break
+        total+=len(chunk)
+        if total>maximum_bytes:raise HTTPException(413,"uploaded file exceeds the 25 MB limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def services(context: RequestContext) -> tuple[DocumentRepository, LocalFilesystemStorage]:
@@ -110,10 +183,11 @@ class MappingSave(BaseModel):
 
 @router.post("/documents", status_code=201, include_in_schema=False)
 @router.post("/documents/upload", status_code=201)
-async def upload_document(file: Annotated[UploadFile, File()], context: Annotated[RequestContext, Depends(request_context)]):
+async def upload_document(file: Annotated[UploadFile, File()], context: Annotated[RequestContext, Depends(permission_dependency(Permission.DOCUMENT_UPLOAD))]):
+    _UPLOAD_LIMITER.require(context.user_id,1)
     repository, storage = services(context)
     try:
-        content = await file.read()
+        content = await read_bounded_upload(file)
         return intake_service(repository, storage).process(
             IntakeContext(context.organization_id, context.company_id, context.user_id),
             file.filename or "document.pdf", file.content_type or "", content,
@@ -161,14 +235,18 @@ def process_durable_batch(batch_id:UUID)->None:
 
 @router.post("/documents/batch", status_code=202)
 async def upload_batch(background_tasks: BackgroundTasks, files: Annotated[list[UploadFile], File()],
-                       context: Annotated[RequestContext, Depends(request_context)]):
+                       context: Annotated[RequestContext, Depends(permission_dependency(Permission.DOCUMENT_UPLOAD))]):
+    _UPLOAD_LIMITER.require(context.user_id,len(files))
     if len(files) > 50:
         raise HTTPException(422, "A batch may contain at most 50 documents")
     repository,storage = services(context)
     batch_id = repository.create_batch(context.organization_id, context.company_id, context.user_id, len(files))
     queue=durable_repository();job_ids=[]
+    batch_bytes=0
     for file in files:
-        content=await file.read();staging_id=uuid4()
+        content=await read_bounded_upload(file,min(MAX_UPLOAD_BYTES,MAX_BATCH_BYTES-batch_bytes));batch_bytes+=len(content)
+        if batch_bytes>MAX_BATCH_BYTES:raise HTTPException(413,"batch exceeds the 250 MB total limit")
+        staging_id=uuid4()
         stored=storage.put_pending(context.organization_id,context.company_id,staging_id,file.filename or "document.pdf",content)
         try:
             job_ids.append(queue.enqueue(context.organization_id,context.company_id,batch_id,context.user_id,
@@ -182,6 +260,7 @@ async def upload_batch(background_tasks: BackgroundTasks, files: Annotated[list[
 
 @router.get("/batches/{batch_id}")
 def batch_status(batch_id: UUID, context: Annotated[RequestContext, Depends(request_context)]):
+    require_permission(context,Permission.DOCUMENT_VIEW)
     repository, _ = services(context)
     result = repository.get_batch(context.organization_id, context.company_id, batch_id)
     if not result:
@@ -192,6 +271,7 @@ def batch_status(batch_id: UUID, context: Annotated[RequestContext, Depends(requ
 
 @router.get("/batches/{batch_id}/documents")
 def batch_documents(batch_id: UUID, context: Annotated[RequestContext, Depends(request_context)]):
+    require_permission(context,Permission.DOCUMENT_VIEW)
     repository, _ = services(context)
     if not repository.get_batch(context.organization_id, context.company_id, batch_id):
         raise HTTPException(404, "Batch not found")
@@ -206,7 +286,7 @@ def list_documents(context: Annotated[RequestContext, Depends(request_context)],
                    review_status: str = "", duplicate_status: str = "", uploaded_by: UUID | None = None,
                    financial_year_id:UUID|None=None,
                    limit: int = Query(100, ge=1, le=250), offset: int = Query(0, ge=0)):
-    repository, _ = services(context)
+    require_permission(context,Permission.DOCUMENT_VIEW);repository, _ = services(context)
     return {"items": repository.list(context.organization_id, context.company_id, status, search, limit, offset,
         date_from=date_from, date_to=date_to, document_type=document_type, supplier=supplier,
         format_family_id=format_family_id, validation_status=validation_status, review_status=review_status,
@@ -215,6 +295,7 @@ def list_documents(context: Annotated[RequestContext, Depends(request_context)],
 
 @router.get("/documents/{document_id}")
 def document_detail(document_id: UUID, context: Annotated[RequestContext, Depends(request_context)]):
+    require_permission(context,Permission.DOCUMENT_VIEW)
     repository, _ = services(context)
     result = repository.get(context.organization_id, context.company_id, document_id)
     if not result:
@@ -225,6 +306,7 @@ def document_detail(document_id: UUID, context: Annotated[RequestContext, Depend
 
 @router.get("/documents/{document_id}/content")
 def document_content(document_id: UUID, context: Annotated[RequestContext, Depends(request_context)]):
+    require_permission(context,Permission.DOCUMENT_VIEW)
     repository, storage = services(context)
     record = repository.get(context.organization_id, context.company_id, document_id)
     if not record:
@@ -235,6 +317,7 @@ def document_content(document_id: UUID, context: Annotated[RequestContext, Depen
 
 @router.get("/documents/{document_id}/pages")
 def document_pages(document_id: UUID, context: Annotated[RequestContext, Depends(request_context)]):
+    require_permission(context,Permission.DOCUMENT_VIEW)
     repository, _ = services(context)
     record = repository.get(context.organization_id, context.company_id, document_id)
     if not record:
@@ -249,12 +332,18 @@ def document_page_image(document_id: UUID, page_number: int,
                         context: Annotated[RequestContext, Depends(request_context)]):
     import pymupdf
 
-    repository, storage = services(context)
+    require_permission(context,Permission.DOCUMENT_VIEW);repository, storage = services(context)
     record = repository.get(context.organization_id, context.company_id, document_id)
     if not record:
         raise HTTPException(404, "Document not found")
     if page_number < 1 or page_number > record["page_count"]:
         raise HTTPException(404, "Document page not found")
+    _PAGE_RENDER_LIMITER.require(context.user_id,1);cache_key=(context.organization_id,context.company_id,document_id,page_number)
+    now=time.monotonic()
+    with _PAGE_RENDER_LOCK:
+        cached=_PAGE_RENDER_CACHE.get(cache_key)
+        if cached and cached[0]>now:
+            return Response(cached[1],media_type="image/png",headers={"Cache-Control":"private, max-age=300","X-Render-Cache":"HIT"})
     document = pymupdf.open(stream=storage.read(record["storage_key"]), filetype="pdf")
     try:
         page = document[page_number - 1]
@@ -262,11 +351,16 @@ def document_page_image(document_id: UUID, page_number: int,
         content = pixmap.tobytes("png")
     finally:
         document.close()
-    return Response(content, media_type="image/png", headers={"Cache-Control": "private, max-age=300"})
+    with _PAGE_RENDER_LOCK:
+        if len(_PAGE_RENDER_CACHE)>=256:
+            oldest=min(_PAGE_RENDER_CACHE,key=lambda item:_PAGE_RENDER_CACHE[item][0]);_PAGE_RENDER_CACHE.pop(oldest,None)
+        _PAGE_RENDER_CACHE[cache_key]=(now+300,content)
+    return Response(content, media_type="image/png", headers={"Cache-Control": "private, max-age=300","X-Render-Cache":"MISS"})
 
 
 @router.get("/documents/{document_id}/extraction")
 def document_extraction(document_id: UUID, context: Annotated[RequestContext, Depends(request_context)]):
+    require_permission(context,Permission.DOCUMENT_VIEW)
     repository, _ = services(context)
     result = repository.extraction(context.organization_id, context.company_id, document_id)
     if not result:
@@ -276,6 +370,7 @@ def document_extraction(document_id: UUID, context: Annotated[RequestContext, De
 
 @router.get("/documents/{document_id}/validation")
 def document_validation(document_id: UUID, context: Annotated[RequestContext, Depends(request_context)]):
+    require_permission(context,Permission.DOCUMENT_VIEW)
     repository, _ = services(context)
     result = repository.validation(context.organization_id, context.company_id, document_id)
     if not result:
@@ -314,7 +409,7 @@ def document_excel(document_id:UUID,context:Annotated[RequestContext,Depends(req
     if not preview["rows"]:raise HTTPException(409,"Excel export has no accounting rows")
     filename=safe_export_filename(record["original_filename"])
     with tempfile.TemporaryDirectory(prefix="bap-excel-") as directory:
-        output=Path(directory)/filename;LegacyExcelExportService().export(preview["rows"],preview["item_rows"],output);content=output.read_bytes()
+        output=Path(directory)/filename;export_excel(preview["rows"],preview["item_rows"],output);content=output.read_bytes()
     digest=hashlib.sha256(content).hexdigest()
     repository.record_export(context.organization_id,context.company_id,document_id,context.user_id,"EXCEL",filename,
         digest,validation["status"],extraction["id"],{"template":preview["template"],"summary":preview["summary"],
@@ -340,7 +435,9 @@ def marketplace_document_preview(document_id:UUID,context:Annotated[RequestConte
     require_permission(context,Permission.MARKETPLACE_PROCESS);documents,storage=services(context)
     record=documents.get(context.organization_id,context.company_id,document_id)
     if not record:raise HTTPException(404,"Document not found")
-    result=marketplace_preview(storage.read(record["storage_key"]),record["original_filename"],context.organization_id,
+    extraction=documents.extraction(context.organization_id,context.company_id,document_id)
+    if not extraction:raise HTTPException(409,"V2 extraction is not available")
+    result=marketplace_preview(extraction["normalized_result"],record["original_filename"],context.organization_id,
         context.company_id,workflow_repository(context))
     return {key:value for key,value in result.items() if key!="profile"}
 
@@ -359,12 +456,13 @@ def marketplace_document_xml(document_id:UUID,context:Annotated[RequestContext,D
     require_permission(context,Permission.XML_EXPORT);documents,storage=services(context)
     record=documents.get(context.organization_id,context.company_id,document_id)
     if not record:raise HTTPException(404,"Document not found")
-    preview=marketplace_preview(storage.read(record["storage_key"]),record["original_filename"],context.organization_id,
+    extraction=documents.extraction(context.organization_id,context.company_id,document_id)
+    if not extraction:raise HTTPException(409,"V2 extraction is not available")
+    preview=marketplace_preview(extraction["normalized_result"],record["original_filename"],context.organization_id,
         context.company_id,workflow_repository(context))
     try:content=marketplace_xml(preview)
     except ValueError as exc:raise HTTPException(409,str(exc)) from exc
     filename=f"{Path(safe_export_filename(record['original_filename'])).stem}.xml";digest=hashlib.sha256(content).hexdigest()
-    extraction=documents.extraction(context.organization_id,context.company_id,document_id)
     documents.record_export(context.organization_id,context.company_id,document_id,context.user_id,"MARKETPLACE_XML",
         filename,digest,preview["validation_status"],extraction["id"] if extraction else None,
         {"mapping_snapshot_sha256":preview["mapping_snapshot_sha256"],"totals":preview["totals"],"row_count":len(preview["rows"])})
@@ -377,7 +475,9 @@ def bank_document_preview(document_id:UUID,context:Annotated[RequestContext,Depe
     record=documents.get(context.organization_id,context.company_id,document_id)
     if not record:raise HTTPException(404,"Document not found")
     settings=get_settings()
-    return bank_preview(storage.read(record["storage_key"]),record["original_filename"],context.organization_id,
+    extraction=documents.extraction(context.organization_id,context.company_id,document_id)
+    if not extraction:raise HTTPException(409,"V2 extraction is not available")
+    return bank_preview(extraction["normalized_result"],record["original_filename"],context.organization_id,
         context.company_id,workflow_repository(context),settings.bank_reconciliation_tolerance)
 
 
@@ -386,12 +486,13 @@ def bank_document_xml(document_id:UUID,context:Annotated[RequestContext,Depends(
     require_permission(context,Permission.XML_EXPORT);documents,storage=services(context)
     record=documents.get(context.organization_id,context.company_id,document_id)
     if not record:raise HTTPException(404,"Document not found")
-    settings=get_settings();preview=bank_preview(storage.read(record["storage_key"]),record["original_filename"],
+    extraction=documents.extraction(context.organization_id,context.company_id,document_id)
+    if not extraction:raise HTTPException(409,"V2 extraction is not available")
+    settings=get_settings();preview=bank_preview(extraction["normalized_result"],record["original_filename"],
         context.organization_id,context.company_id,workflow_repository(context),settings.bank_reconciliation_tolerance)
     try:content=bank_xml(preview)
     except ValueError as exc:raise HTTPException(409,str(exc)) from exc
     filename=f"{Path(safe_export_filename(record['original_filename'])).stem}_bank.xml";digest=hashlib.sha256(content).hexdigest()
-    extraction=documents.extraction(context.organization_id,context.company_id,document_id)
     documents.record_export(context.organization_id,context.company_id,document_id,context.user_id,"BANK_XML",filename,
         digest,preview["validation_status"],extraction["id"] if extraction else None,
         {"mapping_snapshot_sha256":preview["mapping_snapshot_sha256"],"reconciliation":preview["reconciliation"],
@@ -400,7 +501,7 @@ def bank_document_xml(document_id:UUID,context:Annotated[RequestContext,Depends(
 
 
 @router.get("/reviews")
-def review_queue(context: Annotated[RequestContext, Depends(request_context)], status: str = "OPEN",
+def review_queue(context: Annotated[RequestContext, Depends(permission_dependency(Permission.DOCUMENT_REVIEW))], status: str = "OPEN",
                  reason: str = "", severity: str = "", assigned_to: UUID | None = None,
                  date_from: str | None = None, date_to: str | None = None):
     repository, _ = services(context)
@@ -410,7 +511,7 @@ def review_queue(context: Annotated[RequestContext, Depends(request_context)], s
 
 @router.post("/reviews/{review_id}/resolve")
 def resolve_review(review_id: UUID, resolution: ReviewResolution,
-                   context: Annotated[RequestContext, Depends(request_context)]):
+                   context: Annotated[RequestContext, Depends(permission_dependency(Permission.DOCUMENT_REVIEW))]):
     repository, _ = services(context)
     changed = repository.resolve_review(context.organization_id, context.company_id, review_id,
                                         context.user_id, resolution.resolution_note, resolution.status)
@@ -422,14 +523,14 @@ def resolve_review(review_id: UUID, resolution: ReviewResolution,
 @router.get("/reports/document-intelligence")
 def document_report(context: Annotated[RequestContext, Depends(request_context)],
                     date_from: str | None = None, date_to: str | None = None):
-    repository, _ = services(context)
+    require_permission(context,Permission.DOCUMENT_VIEW);repository, _ = services(context)
     return to_jsonable(repository.unified_report(context.organization_id, context.company_id, date_from, date_to))
 
 
 @router.get("/reports/unified")
 def unified_report(context: Annotated[RequestContext, Depends(request_context)],
                    date_from: str | None = None, date_to: str | None = None,financial_year_id:UUID|None=None):
-    repository, _ = services(context)
+    require_permission(context,Permission.DOCUMENT_VIEW);repository, _ = services(context)
     if financial_year_id:
         year=repository.financial_year(context.organization_id,context.company_id,financial_year_id)
         if not year:raise HTTPException(404,"Financial year not found")
@@ -439,10 +540,10 @@ def unified_report(context: Annotated[RequestContext, Depends(request_context)],
 
 @router.get("/financial-years")
 def financial_years(context:Annotated[RequestContext,Depends(request_context)]):
-    repository,_=services(context);return {"items":repository.financial_years(context.organization_id,context.company_id)}
+    require_permission(context,Permission.DOCUMENT_VIEW);repository,_=services(context);return {"items":repository.financial_years(context.organization_id,context.company_id)}
 
 
 @router.get("/reports/format-health")
 def format_health(context: Annotated[RequestContext, Depends(request_context)]):
-    repository, _ = services(context)
+    require_permission(context,Permission.DOCUMENT_VIEW);repository, _ = services(context)
     return {"items": to_jsonable(repository.format_health(context.organization_id, context.company_id))}

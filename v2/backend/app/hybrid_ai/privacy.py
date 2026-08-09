@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import re
 import base64
+import csv
+import io
+import subprocess
+import tempfile
 from io import BytesIO
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Iterable, Sequence
+from pathlib import Path
 
 from PIL import Image, ImageDraw
 
@@ -97,6 +102,32 @@ class PrivacyService:
         image.save(output, format="PNG", optimize=False)
         content = output.getvalue()
         return RedactedImage(content, sha256(content).hexdigest(), width, height, len(boxes))
+
+    @classmethod
+    def sensitive_image_boxes(cls,image_bytes:bytes,tesseract_executable:str,
+                              timeout_seconds:int=30)->tuple[tuple[int,int,int,int],...]:
+        """Locate locally recognized sensitive lines; failure must block cloud vision."""
+        executable=Path(tesseract_executable)
+        if not executable.is_file():raise RuntimeError("local OCR is required to sanitize a cloud vision crop")
+        with tempfile.TemporaryDirectory(prefix="bap-vision-redaction-") as directory:
+            source=Path(directory)/"crop.png";source.write_bytes(image_bytes)
+            try:result=subprocess.run([str(executable),str(source),"stdout","-l","eng","tsv"],capture_output=True,
+                                      text=True,timeout=max(5,min(60,timeout_seconds)),check=False)
+            except subprocess.TimeoutExpired as exc:raise RuntimeError("vision privacy OCR timed out") from exc
+        if result.returncode!=0:raise RuntimeError("vision privacy OCR failed")
+        lines:dict[tuple[str,str,str,str],list[tuple[str,tuple[int,int,int,int]]]]={}
+        for row in csv.DictReader(io.StringIO(result.stdout),delimiter="\t"):
+            value=str(row.get("text") or "").strip()
+            if not value:continue
+            try:left,top,width,height=(int(row[name]) for name in ("left","top","width","height"))
+            except (KeyError,TypeError,ValueError):continue
+            key=tuple(str(row.get(name) or "") for name in ("page_num","block_num","par_num","line_num"))
+            lines.setdefault(key,[]).append((value,(left,top,left+width,top+height)))
+        boxes=[]
+        for words in lines.values():
+            text=" ".join(value for value,_ in words)
+            if any(pattern.search(text) for _,pattern in cls._patterns):boxes.extend(box for _,box in words)
+        return tuple(boxes)
 
     @staticmethod
     def cloud_payload_preview(value: SanitizedPayload, *, image: RedactedImage | None,

@@ -12,7 +12,8 @@ from unittest.mock import Mock
 from unittest.mock import patch
 from uuid import uuid4
 
-from v2.backend.app.hybrid_ai.models import AiMode, BillingMode, PrivacyMode, ResultState, TenantContext
+from v2.backend.app.hybrid_ai.models import (AiMode, BillingMode, PrivacyMode, ProviderResult,
+    ProviderUsage, ResultState, TenantContext)
 from v2.backend.app.hybrid_ai.dispatcher import ResetDispatcher, ResetQueuedJob
 from v2.backend.app.hybrid_ai.multi_pdf import PdfSample, bounded_refinement, cluster_samples, representative_samples
 from v2.backend.app.hybrid_ai.policy import AiPolicyService, PolicyDenied
@@ -72,6 +73,15 @@ class PrivacyTests(unittest.TestCase):
             model="synthetic",task="VISION_TEST",estimated_usage=50)
         self.assertTrue(str(preview["sanitized_image_data_url"]).startswith("data:image/png;base64,"))
         self.assertFalse(preview["credentials_included"]);self.assertFalse(preview["reversible_map_transmitted"])
+
+    def test_cloud_vision_sensitive_boxes_are_derived_by_local_ocr(self):
+        from subprocess import CompletedProcess
+        tsv="level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n5\t1\t1\t1\t1\t1\t10\t20\t80\t15\t95\tABCDE1234F\n"
+        with tempfile.TemporaryDirectory() as directory:
+            executable=Path(directory)/"tesseract.exe";executable.write_bytes(b"synthetic")
+            with patch("v2.backend.app.hybrid_ai.privacy.subprocess.run",return_value=CompletedProcess([],0,tsv,"")):
+                boxes=PrivacyService.sensitive_image_boxes(b"synthetic-image",str(executable))
+        self.assertEqual(boxes,((10,20,90,35),))
 
 
 class QuotaTests(unittest.TestCase):
@@ -257,7 +267,36 @@ class ProposalAndOrchestratorTests(unittest.TestCase):
         result=service.propose(TenantContext(uuid4(),uuid4(),uuid4(),frozenset({"ADMIN"})),
             intent="draft_template",text="synthetic",selection={})
         self.assertEqual(result["state"],ResultState.PROVIDER_FAILED)
-        self.assertEqual((quota.used,quota.reserved),(500,0))
+        self.assertEqual(quota.reserved,0)
+        self.assertGreater(quota.used,0)
+        self.assertNotEqual(quota.used,500)
+
+    def test_cloud_reservation_is_a_versioned_payload_upper_bound(self):
+        small=HybridAiService.estimate_cloud_units("x",False,None)
+        large=HybridAiService.estimate_cloud_units("x"*100_000,False,None)
+        vision=HybridAiService.estimate_cloud_units("x",True,"data:image/png;base64,"+("A"*100_000))
+        self.assertGreater(large,small);self.assertGreater(vision,small)
+        self.assertRegex(HybridAiService.USAGE_ESTIMATE_VERSION,r"^cloudflare-workers-ai-\d{4}-\d{2}-\d{2}-v\d+$")
+
+    def test_unhealthy_local_runtime_uses_single_bounded_cloud_escalation(self):
+        local=Mock();local.healthy.return_value=False
+        cloud=Mock();cloud.complete.return_value=ProviderResult(self.payload(),ProviderUsage(
+            application_estimated_neurons=25,accounted_neurons=25),"CLOUDFLARE_WORKERS_AI",
+            "@cf/zai-org/glm-4.7-flash",1)
+        service=HybridAiService(local=local,cloud=cloud,quota=AiQuotaService(10_000))
+        result=service.propose(TenantContext(uuid4(),uuid4(),uuid4(),frozenset({"ADMIN"})),
+            intent="draft_template",text="synthetic",selection={})
+        self.assertEqual(result["state"],ResultState.READY_FOR_REVIEW)
+        local.complete.assert_not_called();cloud.complete.assert_called_once()
+        self.assertEqual(result["route_reason"],"LOCAL_RUNTIME_UNAVAILABLE")
+
+    def test_vision_never_accepts_a_missing_server_sanitized_crop(self):
+        cloud=Mock()
+        result=HybridAiService(local=None,cloud=cloud).propose(
+            TenantContext(uuid4(),uuid4(),uuid4(),frozenset({"ADMIN"})),intent="draft_template",
+            text="synthetic",selection={},requires_vision=True)
+        self.assertEqual(result["state"],ResultState.POLICY_BLOCKED)
+        cloud.complete.assert_not_called()
 
     def test_api_worker_ui_and_migration_contracts_exist(self):
         from v2.backend.app.main import app
@@ -322,6 +361,21 @@ class Phase5PostgresTests(unittest.TestCase):
         service=PostgresAiQuotaService(tenant_factory(url,org,company,user),org,company,"synthetic-byoc",1000)
         reserved=service.reserve(200);self.assertEqual(reserved.reserved,200)
         reconciled=service.reconcile(reserved.reservation_id,120);self.assertEqual((reconciled.used,reconciled.reserved),(120,0))
+
+    def test_ai_job_cancel_is_creator_or_privileged_only(self):
+        import psycopg
+        url=os.environ["POSTGRES_TEST_DATABASE_URL"];org,company,creator,other=uuid4(),uuid4(),uuid4(),uuid4()
+        connection=psycopg.connect(url);apply_migrations(connection)
+        with connection.cursor() as cursor:
+            cursor.execute("INSERT INTO organizations(id,name) VALUES(%s,%s)",(org,f"AI cancel {org}"));set_tenant(cursor,org,company)
+            cursor.execute("INSERT INTO companies(id,organization_id,name,tally_company_name) VALUES(%s,%s,'AI cancel','AI cancel')",(company,org))
+            for user in (creator,other):cursor.execute("INSERT INTO users(id,organization_id,email,display_name,status) VALUES(%s,%s,%s,'AI user','ACTIVE')",(user,org,f"{user}@example.invalid"))
+        connection.commit();connection.close();repository=AiRepository(tenant_factory(url,org,company,creator))
+        creator_job=repository.create_job(org,company,creator,"draft_template","HYBRID_PRIVATE","BALANCED","v1")
+        self.assertFalse(repository.cancel_job(org,company,creator_job["id"],other,False))
+        self.assertTrue(repository.cancel_job(org,company,creator_job["id"],creator,False))
+        privileged_job=repository.create_job(org,company,creator,"draft_template","HYBRID_PRIVATE","BALANCED","v1")
+        self.assertTrue(repository.cancel_job(org,company,privileged_job["id"],other,True))
 
     def test_correction_memory_retrieves_only_approved_same_tenant_examples(self):
         import psycopg

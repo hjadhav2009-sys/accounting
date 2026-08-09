@@ -3,3 +3,4 @@
 -r requirements.txt
 -r requirements-v2.txt
 httpx2>=2.9,<3
+pip-audit==2.9.0
