@@ -101,6 +101,10 @@ class SemanticParityTests(unittest.TestCase):
 
 
 class MigrationPreviewSafetyTests(unittest.TestCase):
+    @unittest.skipUnless(
+        (ROOT / "data" / "business_rules.db").exists(),
+        "private authoritative SQLite source is intentionally unavailable",
+    )
     def test_current_authoritative_source_has_expected_company_mapping_partition(self):
         source=ROOT/"data"/"business_rules.db"
         self.assertEqual(file_sha256(source).upper(),"87E55412BB10C7D953E3F971F45F455E3A7769D179C9DE2D84575BF47616AE5E")

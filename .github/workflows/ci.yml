@@ -58,7 +58,12 @@ jobs:
         working-directory: cloudflare/ai-worker
       - name: Authoritative SQLite immutability gate
         shell: bash
-        run: test "$(sha256sum data/business_rules.db | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')" = "87E55412BB10C7D953E3F971F45F455E3A7769D179C9DE2D84575BF47616AE5E"
+        run: |
+          if [ -f data/business_rules.db ]; then
+            test "$(sha256sum data/business_rules.db | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')" = "87E55412BB10C7D953E3F971F45F455E3A7769D179C9DE2D84575BF47616AE5E"
+          else
+            echo "Private authoritative SQLite source is intentionally absent from public CI."
+          fi
       - name: Public-tree safety
         shell: bash
         run: |
