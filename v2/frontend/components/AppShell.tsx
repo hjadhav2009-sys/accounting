@@ -5,7 +5,7 @@ import { ReviewBadge } from "./ReviewBadge";
 
 const navigation = [
   ["Dashboard", "/"], ["Documents", "/documents"], ["Review Queue", "/reviews"],
-  ["Templates", "/templates"], ["Reports", "/reports"], ["PDF to Excel", "#"], ["Invoice Converter", "#"],
+  ["Templates", "/templates"], ["Reports", "/reports"], ["AI Intelligence", "/ai"], ["PDF to Excel", "#"], ["Invoice Converter", "#"],
   ["Marketplace XML", "#"], ["Bank Statement XML", "#"], ["Database / Masters", "#"],
   ["Users", "#"], ["Settings", "#"],
 ] as const;

@@ -26,6 +26,8 @@ class SystemInfoResponse(ApiModel):
     legacy_authority: str
     postgres_cutover: str
     ai_inference: str
+    ai_mode: str
+    ai_billing_mode: str
     sqlite_authoritative: str
     postgres_connected: str
     shadow_mode: str

@@ -34,6 +34,6 @@ app.add_middleware(
     allow_origins=list(settings.cors_origins),
     allow_credentials=False,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "X-Organization-ID", "X-Company-ID", "X-User-ID"],
+    allow_headers=["Content-Type", "X-Organization-ID", "X-Company-ID", "X-User-ID", "X-Roles"],
 )
 app.include_router(router)

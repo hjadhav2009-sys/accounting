@@ -5,11 +5,13 @@ from .schemas import DevelopmentStatusResponse, HealthResponse, SystemInfoRespon
 from ..infrastructure.runtime_status import refresh_runtime_status, runtime_status
 from .document_routes import router as document_intelligence_router
 from .template_routes import router as template_studio_router
+from .ai_routes import router as hybrid_ai_router
 
 
 router = APIRouter()
 router.include_router(document_intelligence_router)
 router.include_router(template_studio_router)
+router.include_router(hybrid_ai_router)
 
 
 @router.get("/health", response_model=HealthResponse, tags=["system"])

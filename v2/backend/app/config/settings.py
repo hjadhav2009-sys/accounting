@@ -13,7 +13,7 @@ DEFAULT_STORAGE_ROOT = REPOSITORY_ROOT / "v2_data" / "documents"
 @dataclass(frozen=True)
 class Settings:
     app_name: str = "Business Automation Platform"
-    api_version: str = "2.0-phase4-template-studio"
+    api_version: str = "2.0-phase5-hybrid-ai"
     environment: str = "development"
     database_adapter_mode: str = "LEGACY_SQLITE"
     database_url: str = ""
@@ -23,6 +23,20 @@ class Settings:
     cloudflare_account_id: str = ""
     cloudflare_api_token: str = ""
     cloudflare_ai_gateway_id: str = ""
+    ai_mode: str = "HYBRID_PRIVATE"
+    ai_billing_mode: str = "FREE_ONLY"
+    ai_privacy_mode: str = "BALANCED"
+    local_ai_endpoint: str = "http://127.0.0.1:8080/v1/chat/completions"
+    local_ai_model: str = ""
+    local_ai_api_key: str = ""
+    local_ai_api_key_file: str = ""
+    cloudflare_ai_worker_url: str = ""
+    cloudflare_ai_worker_hmac_secret: str = ""
+    cloudflare_ai_worker_hmac_secret_file: str = ""
+    cloudflare_ai_model: str = "@cf/zai-org/glm-4.7-flash"
+    cloudflare_ai_vision_model: str = "@cf/google/gemma-4-26b-a4b-it"
+    ai_phase5_runtime_certified: bool = False
+    ai_daily_free_neurons: int = 10000
     postgres_shadow_enabled: bool = False
     dev_endpoints_enabled: bool = False
     cors_origins: tuple[str, ...] = ("http://localhost:3000", "http://127.0.0.1:3000")
@@ -33,6 +47,16 @@ class Settings:
 
     @classmethod
     def from_environment(cls) -> "Settings":
+        key_file = os.getenv("LOCAL_AI_API_KEY_FILE", "").strip()
+        local_key = os.getenv("LOCAL_AI_API_KEY", "").strip()
+        if not local_key and key_file:
+            try: local_key = Path(key_file).read_text(encoding="utf-8").strip()
+            except OSError: local_key = ""
+        cloud_secret_file = os.getenv("CLOUDFLARE_AI_WORKER_HMAC_SECRET_FILE", "").strip()
+        cloud_secret = os.getenv("CLOUDFLARE_AI_WORKER_HMAC_SECRET", "").strip()
+        if not cloud_secret and cloud_secret_file:
+            try: cloud_secret = Path(cloud_secret_file).read_text(encoding="utf-8").strip()
+            except OSError: cloud_secret = ""
         return cls(
             environment=os.getenv("APP_ENV", "development").strip().lower(),
             database_adapter_mode=os.getenv("DATABASE_ADAPTER_MODE", "LEGACY_SQLITE").strip().upper(),
@@ -43,6 +67,20 @@ class Settings:
             cloudflare_account_id=os.getenv("CLOUDFLARE_ACCOUNT_ID", ""),
             cloudflare_api_token=os.getenv("CLOUDFLARE_API_TOKEN", ""),
             cloudflare_ai_gateway_id=os.getenv("CLOUDFLARE_AI_GATEWAY_ID", ""),
+            ai_mode=os.getenv("AI_MODE", "HYBRID_PRIVATE").strip().upper(),
+            ai_billing_mode=os.getenv("AI_BILLING_MODE", "FREE_ONLY").strip().upper(),
+            ai_privacy_mode=os.getenv("AI_PRIVACY_MODE", "BALANCED").strip().upper(),
+            local_ai_endpoint=os.getenv("LOCAL_AI_ENDPOINT", "http://127.0.0.1:8080/v1/chat/completions").strip(),
+            local_ai_model=os.getenv("LOCAL_AI_MODEL", "").strip(),
+            local_ai_api_key=local_key,
+            local_ai_api_key_file=key_file,
+            cloudflare_ai_worker_url=os.getenv("CLOUDFLARE_AI_WORKER_URL", "").strip(),
+            cloudflare_ai_worker_hmac_secret=cloud_secret,
+            cloudflare_ai_worker_hmac_secret_file=cloud_secret_file,
+            cloudflare_ai_model=os.getenv("CLOUDFLARE_AI_MODEL", "@cf/zai-org/glm-4.7-flash").strip(),
+            cloudflare_ai_vision_model=os.getenv("CLOUDFLARE_AI_VISION_MODEL", "@cf/google/gemma-4-26b-a4b-it").strip(),
+            ai_phase5_runtime_certified=os.getenv("AI_PHASE5_RUNTIME_CERTIFIED", "").strip().lower() in {"1", "true", "yes"},
+            ai_daily_free_neurons=max(1, int(os.getenv("AI_DAILY_FREE_NEURONS", "10000"))),
             postgres_shadow_enabled=os.getenv("POSTGRES_SHADOW_ENABLED", "").strip().lower() in {"1", "true", "yes"},
             dev_endpoints_enabled=os.getenv("V2_DEV_ENDPOINTS_ENABLED", "").strip().lower() in {"1", "true", "yes"},
             cors_origins=tuple(origin.strip() for origin in os.getenv(
@@ -63,7 +101,9 @@ class Settings:
             "storage_mode": self.storage_mode,
             "legacy_authority": "enabled",
             "postgres_cutover": "disabled",
-            "ai_inference": "disabled",
+            "ai_inference": "configured" if (self.local_ai_model or self.cloudflare_ai_worker_url) else "disabled",
+            "ai_mode": self.ai_mode,
+            "ai_billing_mode": self.ai_billing_mode,
             "sqlite_authoritative": "true",
             "postgres_connected": "unknown" if (self.database_url or self.postgres_url) else "false",
             "shadow_mode": "true" if self.postgres_shadow_enabled else "false",

@@ -35,6 +35,18 @@ v2/frontend/build-phase2/
 v2/frontend/build-phase2b/
 *.tsbuildinfo
 
+# Phase 5 local AI assets and sanitized/cloud debugging payloads
+*.gguf
+*.ggml
+models/
+ai_models/
+local_models/
+local_tools/
+*.secret
+cloud_payloads/
+sanitized_payloads/
+cloudflare/ai-worker/.wrangler/
+
 # Generated accounting exports / source documents
 *.pdf
 *.xlsx
